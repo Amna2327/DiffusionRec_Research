@@ -17,6 +17,8 @@ Usage:
 """
 
 import os
+import sys
+sys.path.append(os.path.abspath("/content/DiffusionRec_Research/models"))
 import csv
 import random
 import argparse
