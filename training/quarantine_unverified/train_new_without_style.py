@@ -597,12 +597,12 @@ import uuid
 import json
 from diffusers import AutoencoderKL, DDIMScheduler
 import random
-from unet import UNetModel
+from models.unet import UNetModel
 import wandb
 from torchvision import transforms
 from feature_extractor import ImageEncoder
-from utils.unhd_dataset import UNHDDataset # Import UNHD dataset
-from utils.auxilary_functions import *
+from data.utils.unhd_dataset import UNHDDataset # Import UNHD dataset
+from data.utils.auxilary_functions import *
 from torchvision.utils import save_image
 from torch.nn import DataParallel
 from transformers import CanineModel, CanineTokenizer

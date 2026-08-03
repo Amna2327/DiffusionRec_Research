@@ -14,13 +14,13 @@ import json
 from diffusers import AutoencoderKL, DDIMScheduler
 import random
 # Assume unet.py defines UNetModel
-from unet import UNetModel
+from models.unet import UNetModel
 import wandb
 from torchvision import transforms
 # Assume feature_extractor.py defines ImageEncoder
 # from feature_extractor import ImageEncoder
-from utils.upti_dataset_subset import UPTIDataset  # Assume this defines dataset with character_classes
-from utils.auxilary_functions import *  # Assume auxiliary functions
+from data.utils.upti_dataset_subset import UPTIDataset  # Assume this defines dataset with character_classes
+from data.utils.auxilary_functions import *  # Assume auxiliary functions
 from torchvision.utils import save_image
 from torch.nn import DataParallel
 from transformers import CanineModel, CanineTokenizer

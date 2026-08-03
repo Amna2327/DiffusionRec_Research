@@ -15,12 +15,12 @@ import json
 from diffusers import AutoencoderKL, DDIMScheduler
 import random
 # Assume unet.py defines UNetModel
-from unet import UNetModel
+from models.unet import UNetModel
 import wandb
 from torchvision import transforms
 # Import word generation dataset
-from utils.word_generation_dataset import WordGenerationDataset
-from utils.auxilary_functions import *
+from data.utils.word_generation_dataset import WordGenerationDataset
+from data.utils.auxilary_functions import *
 from torchvision.utils import save_image
 from torch.nn import DataParallel
 from transformers import CanineModel, CanineTokenizer

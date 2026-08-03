@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 import torchvision
 from tqdm import tqdm
 from diffusers import AutoencoderKL, DDIMScheduler
-from unet import UNetModel
+from models.unet import UNetModel
 from torchvision import transforms
 from torch.nn import DataParallel
 from transformers import CanineModel, CanineTokenizer
@@ -167,8 +167,8 @@ def recognize_urdu_batch_google_vision(image_tensors):
         recognized_texts.append(text)
     return recognized_texts
 
-from utils.upti_dataset_subset import UPTIDataset
-from utils.auxilary_functions import *
+from data.utils.upti_dataset_subset import UPTIDataset
+from data.utils.auxilary_functions import *
 
 # Evaluation Helper Functions
 def get_inception_model(device):

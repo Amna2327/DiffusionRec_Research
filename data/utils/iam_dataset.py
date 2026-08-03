@@ -1,7 +1,7 @@
 import numpy as np 
 from skimage import io as img_io
-from utils.word_dataset import WordLineDataset
-from utils.auxilary_functions import image_resize_PIL, centered_PIL
+from data.utils.word_dataset import WordLineDataset
+from data.utils.auxilary_functions import image_resize_PIL, centered_PIL
 from PIL import Image, ImageOps
 import json
 import os

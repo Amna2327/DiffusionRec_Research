@@ -6,19 +6,29 @@ already expects.
 
 Run from the same directory as unet.py (needs it importable).
 
-Usage:
+Usage (random mode — calibration-style, independent draw):
   python generate_word_samples.py \
+    --mode random \
     --ckpt_dir /content/DiffusionRec_Research/word_level_model/models \
     --test_gt_folder /content/DiffusionRec_Research/Urdu_Word_Dataset/test/gt_txt \
     --out_dir generated_samples \
     --n_words 200 \
     --seed 42 \
     --stable_dif_path stable-diffusion-v1-5/stable-diffusion-v1-5
+
+Usage (fixed mode — Test 1's word-matched real-vs-generated comparison):
+  python generate_word_samples.py \
+    --mode fixed \
+    --words_file test1_wordlist.txt \
+    --ckpt_dir /content/DiffusionRec_Research/word_level_model/models \
+    --out_dir generated_samples_test1 \
+    --stable_dif_path stable-diffusion-v1-5/stable-diffusion-v1-5
 """
 
 import os
 import sys
 sys.path.append(os.path.abspath("/content/DiffusionRec_Research/models"))
+
 import csv
 import random
 import argparse
@@ -47,7 +57,14 @@ def strip_module_prefix(state_dict):
     return new_sd
 
 
-def sample_target_words(gt_folder: str, n: int, seed: int):
+def sample_target_words(mode: str, gt_folder: str, n: int, seed: int, words_file: str = None):
+    if mode == "fixed":
+        with open(words_file, "r", encoding="utf-8") as f:
+            words = [w.strip() for w in f if w.strip()]
+        print(f"[mode=fixed] Loaded {len(words)} words from: {words_file}")
+        return words
+
+    # mode == "random"
     words = []
     for fname in os.listdir(gt_folder):
         if not fname.endswith(".txt"):
@@ -69,7 +86,6 @@ def generate_batch(unet, vae, tokenizer, text_encoder, words, args, batch_size=8
     """Text-conditioned DDIM sampling, mirroring Diffusion.sampling() in the
     training script but standalone so we don't need to import the whole
     training module (and its recognizer-loading side effects) just to sample."""
-    beta = torch.linspace(1e-4, 2e-2, 1000).to(args.device)  # unused directly; scheduler handles noise math
     ddim = DDIMScheduler.from_pretrained(args.stable_dif_path, subfolder="scheduler")
     ddim.set_timesteps(50)
 
@@ -113,7 +129,14 @@ def generate_batch(unet, vae, tokenizer, text_encoder, words, args, batch_size=8
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt_dir", required=True, help="Folder containing ema_ckpt.pt")
-    ap.add_argument("--test_gt_folder", required=True)
+    ap.add_argument("--mode", required=True, choices=["random", "fixed"],
+                     help="'random': sample n_words at random from --test_gt_folder (calibration-style). "
+                          "'fixed': generate exactly the words listed in --words_file, in order "
+                          "(use this for Test 1's word-matched real-vs-generated comparison).")
+    ap.add_argument("--test_gt_folder", default=None,
+                     help="Required if --mode random. Folder of .txt ground-truth files to sample from.")
+    ap.add_argument("--words_file", default=None,
+                     help="Required if --mode fixed. Plain text file, one word per line.")
     ap.add_argument("--out_dir", default="generated_samples")
     ap.add_argument("--n_words", type=int, default=200)
     ap.add_argument("--seed", type=int, default=42)
@@ -153,7 +176,12 @@ def main():
     unet.load_state_dict(strip_module_prefix(state_dict))
     unet.requires_grad_(False)
 
-    words = sample_target_words(args_cli.test_gt_folder, args_cli.n_words, args_cli.seed)
+    if args_cli.mode == "random" and not args_cli.test_gt_folder:
+        raise ValueError("--mode random requires --test_gt_folder")
+    if args_cli.mode == "fixed" and not args_cli.words_file:
+        raise ValueError("--mode fixed requires --words_file")
+
+    words = sample_target_words(args_cli.mode, args_cli.test_gt_folder, args_cli.n_words, args_cli.seed, args_cli.words_file)
     print(f"Sampled {len(words)} target words (seed={args_cli.seed})")
 
     results = generate_batch(unet, vae, tokenizer, text_encoder, words, args, args_cli.batch_size)
