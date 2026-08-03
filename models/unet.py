@@ -217,7 +217,7 @@ class CrossAttention(nn.Module):
             sim.masked_fill_(~mask, max_neg_value)
 
         # attention, what we cannot get enough of
-        attn = sim.softmax(dim=-1)
+        attn = sim.float().softmax(dim=-1).type(sim.dtype)
 
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
@@ -1330,8 +1330,9 @@ class UNetModel(nn.Module):
                 emb = emb + self.label_emb(y)
             
         if context is not None:
-            
-            context = self.text_encoder(**context).last_hidden_state#.to(x.device)
+            with torch.cuda.amp.autocast(enabled=False):
+                context = self.text_encoder(**{k: v for k, v in context.items()}).last_hidden_state
+            context = context.float()
            
             if self.cont_dim == 320:
                 context = self.text_lin(context)#.unsqueeze(1)
