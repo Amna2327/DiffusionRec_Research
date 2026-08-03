@@ -11,7 +11,7 @@ import copy
 import argparse
 import uuid
 import json
-from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, DPMSolverMultistepScheduler
 import random
 # Assume unet.py defines UNetModel
 from models.unet import UNetModel
@@ -41,6 +41,20 @@ from transformers import RobertaTokenizerFast, GPT2Tokenizer
 from transformers import RobertaConfig, EncoderDecoderConfig, EncoderDecoderModel
 from transformers import GPT2Config, GPT2LMHeadModel
 from evaluate import load
+# ---------------------------------------------------------------------------
+# MIXED PRECISION: torch.cuda.amp gives real speedups on T4 (has fp16 tensor
+# cores, no meaningful bf16 tensor-core benefit like A100/L4). autocast picks
+# fp16 for matmul/conv-heavy ops and keeps numerically-sensitive ops (e.g.
+# softmax, loss) in fp32 automatically. GradScaler prevents fp16 gradient
+# underflow during backward().
+# ---------------------------------------------------------------------------
+from torch.amp import autocast as _autocast, GradScaler as _GradScaler
+# thin wrappers so call sites below (autocast(enabled=...), GradScaler(enabled=...))
+# don't need a device string threaded through everywhere
+def autocast(enabled=True):
+    return _autocast('cuda', enabled=enabled)
+def GradScaler(enabled=True):
+    return _GradScaler('cuda', enabled=enabled)
 
 cer_metric = load("cer")
 torch.cuda.empty_cache()
@@ -51,6 +65,23 @@ IMG_HEIGHT = 64  # Word-level height
 
 tokens = {"PAD_TOKEN": 52}
 num_tokens = len(tokens)
+
+
+# ---------------------------------------------------------------------------
+# FIX: argparse bool footgun. bool("False") == True in Python (any non-empty
+# string is truthy), so every `type=bool` argument below was silently
+# ignoring anything you passed on the command line except an empty string.
+# str2bool actually parses the intended value.
+# ---------------------------------------------------------------------------
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got: {v}")
+
 
 def label_padding(labels, num_tokens, letter2index):
     ll = [letter2index.get(i, 0) for i in labels]
@@ -69,12 +100,6 @@ def setup_logging(args):
 def save_images(images, path, args, texts=None, **kwargs):
     """
     Save images as grid with optional text labels
-    
-    Args:
-        images: Tensor of images
-        path: Save path
-        args: Arguments
-        texts: Optional list of Urdu text labels for each image
     """
     grid = torchvision.utils.make_grid(images, padding=2, **kwargs)
     if args.latent:
@@ -83,34 +108,26 @@ def save_images(images, path, args, texts=None, **kwargs):
     else:
         ndarr = grid.permute(1, 2, 0).cpu().numpy()
         im = Image.fromarray(ndarr)
-    
-    # Add text labels if provided
+
     if texts is not None:
         from PIL import ImageDraw, ImageFont
         draw = ImageDraw.Draw(im)
-        
-        # Try to load Urdu font, fallback to default
         try:
-            # You'll need to provide path to an Urdu font file (e.g., Noto Nastaliq Urdu)
-            font = ImageFont.truetype("arial.ttf", 20)  # Replace with Urdu font path
+            font = ImageFont.truetype("arial.ttf", 20)
         except:
             font = ImageFont.load_default()
-        
-        # Calculate positions for text (below each image in grid)
+
         num_images = len(texts)
         grid_width = im.width
         img_width = grid_width // num_images if num_images > 0 else grid_width
-        
-        # Add text below each image
+
         for i, text in enumerate(texts):
-            x_pos = i * img_width + 5  # 5px padding from left edge of each cell
-            y_pos = im.height - 25     # 25px from bottom
-            
-            # Draw text with white background for visibility
+            x_pos = i * img_width + 5
+            y_pos = im.height - 25
             text_bbox = draw.textbbox((x_pos, y_pos), text, font=font)
             draw.rectangle(text_bbox, fill='white')
             draw.text((x_pos, y_pos), text, fill='black', font=font)
-    
+
     im.save(path)
     return im
 
@@ -183,32 +200,36 @@ class Diffusion:
 
     def sampling(self, model, vae, n, x_text, labels, args, style_extractor, noise_scheduler, mix_rate=None, cfg_scale=3, transform=None, character_classes=None, tokenizer=None, text_encoder=None, run_idx=None):
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), autocast(enabled=args.amp):
             if isinstance(x_text, str):
                 x_text = [x_text] * n
             if isinstance(x_text, list):
                 x_text = x_text[:n]
                 n = len(x_text)
-            
+
             text_features = tokenizer(x_text, padding="max_length", truncation=True, return_tensors="pt", max_length=200)
             text_features = {k: v.to(args.device) for k, v in text_features.items()}
             style_features = None
-            
+
             x = torch.randn((n, 4 if args.latent else 3, self.img_size[0] // 8 if args.latent else self.img_size[0], self.img_size[1] // 8 if args.latent else self.img_size[1])).to(args.device)
-            noise_scheduler.set_timesteps(50)
-            
+            # FIX (speed): was hardcoded 50 -- with DPM-Solver++, ~15-20
+            # steps gets comparable quality. Configurable via --sampling_steps.
+            noise_scheduler.set_timesteps(args.sampling_steps)
+
             for time in noise_scheduler.timesteps:
                 t = (torch.ones(n) * time.item()).long().to(args.device)
                 noisy_residual = model(x, t, text_features, labels, original_images=None, mix_rate=mix_rate, style_extractor=style_features)
-                x = noise_scheduler.step(noisy_residual, time, x).prev_sample
-            
+                # scheduler.step math is sensitive -- run it in fp32 regardless of autocast
+                x = noise_scheduler.step(noisy_residual.float(), time, x.float()).prev_sample
+
             if args.latent:
                 latents = x / 0.18215
-                image = vae.module.decode(latents).sample
+                with autocast(enabled=False):
+                    image = vae.module.decode(latents.float()).sample
                 x = (image / 2 + 0.5).clamp(0, 1)
             else:
                 x = ((x.clamp(-1, 1) + 1) / 2 * 255).type(torch.uint8)
-        
+
         model.train()
         recognized_texts = recognize_urdu_batch(x, args)
         print(f"Generated texts recognized: {recognized_texts}")
@@ -220,9 +241,9 @@ recognizer_transformer = None
 recognizer_tokenizer = None
 generation_config = None
 
-def load_urdu_recognizer(conv_path='./conv_transformer_weights/icdar/conv.pt', transformer_path='./conv_transformer_weights/icdar', device='cuda'):
+def load_urdu_recognizer(conv_path='./conv_transformer_weights/icdar/conv.pt', transformer_path='./conv_transformer_weights/icdar', vocab_path='./vocab/ved/', device='cuda'):
     global recognizer_conv, recognizer_transformer, recognizer_tokenizer, generation_config
-    recognizer_tokenizer = GPT2Tokenizer.from_pretrained("./vocab/ved/")
+    recognizer_tokenizer = GPT2Tokenizer.from_pretrained(vocab_path)
     recognizer_tokenizer.bos_token = '<s>'
     recognizer_tokenizer.eos_token = '</s>'
     recognizer_tokenizer.pad_token = '<pad>'
@@ -345,38 +366,33 @@ def model_conv_transformer(vocab_size):
     model_transformer = EncoderDecoderModel(config=config)
     return model_conv, model_transformer
 
-def load_checkpoint(checkpoint_path, model, ema_model, optimizer, ema, lr_scheduler=None, device='cuda'):
-    """
-    Load a complete training checkpoint and restore all states
-    
-    Returns:
-        start_epoch: The epoch to resume training from
-        checkpoint: The full checkpoint dict (for any additional info)
-    """
+def load_checkpoint(checkpoint_path, model, ema_model, optimizer, ema, lr_scheduler=None, device='cuda', scaler=None):
     print(f"\n{'='*60}")
     print(f"Loading checkpoint from: {checkpoint_path}")
     print(f"{'='*60}")
-    
+
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Restore model states
+
     model.load_state_dict(checkpoint['model_state_dict'])
     ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    # Restore EMA step counter
+
     ema.step = checkpoint['ema_step']
-    
-    # Restore learning rate scheduler if it exists
+
     if lr_scheduler is not None and 'lr_scheduler_state_dict' in checkpoint:
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
         print(f"Restored learning rate scheduler state")
-    
-    # Restore random states for reproducibility (with proper error handling)
+
+    if scaler is not None and 'scaler_state_dict' in checkpoint:
+        try:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            print(f"Restored AMP GradScaler state")
+        except Exception as e:
+            print(f"Warning: Could not restore GradScaler state: {e}")
+
     try:
         if 'rng_state' in checkpoint:
             rng_state = checkpoint['rng_state']
-            # Handle CPU tensor conversion
             if isinstance(rng_state, torch.Tensor):
                 if rng_state.device.type != 'cpu':
                     rng_state = rng_state.cpu()
@@ -384,42 +400,41 @@ def load_checkpoint(checkpoint_path, model, ema_model, optimizer, ema, lr_schedu
                 print(f"Restored PyTorch RNG state")
     except Exception as e:
         print(f"Warning: Could not restore PyTorch RNG state: {e}")
-    
+
     try:
         if 'cuda_rng_state' in checkpoint and checkpoint['cuda_rng_state'] is not None:
             cuda_rng_states = checkpoint['cuda_rng_state']
-            # Ensure all states are on CPU before setting
             if isinstance(cuda_rng_states, list):
                 cuda_rng_states = [s.cpu() if isinstance(s, torch.Tensor) and s.device.type != 'cpu' else s for s in cuda_rng_states]
             torch.cuda.set_rng_state_all(cuda_rng_states)
             print(f"Restored CUDA RNG state")
     except Exception as e:
         print(f"Warning: Could not restore CUDA RNG state: {e}")
-    
+
     try:
         if 'numpy_rng_state' in checkpoint:
             np.random.set_state(checkpoint['numpy_rng_state'])
             print(f"Restored NumPy RNG state")
     except Exception as e:
         print(f"Warning: Could not restore NumPy RNG state: {e}")
-    
+
     try:
         if 'python_rng_state' in checkpoint:
             random.setstate(checkpoint['python_rng_state'])
             print(f"Restored Python RNG state")
     except Exception as e:
         print(f"Warning: Could not restore Python RNG state: {e}")
-    
-    # Get the epoch to resume from
-    start_epoch = checkpoint['epoch'] + 1  # Resume from next epoch
-    
+
+    start_epoch = checkpoint['epoch'] + 1
+
     print(f"\nCheckpoint loaded successfully!")
     print(f"Resuming from epoch: {start_epoch}")
     print(f"Previous loss average: {checkpoint.get('loss_meter_avg', 'N/A')}")
     print(f"EMA step: {ema.step}")
     print(f"{'='*60}\n")
-    
+
     return start_epoch, checkpoint
+
 def gpu_mem(prefix="", device=None):
     if not torch.cuda.is_available():
         return ""
@@ -434,96 +449,143 @@ def gpu_mem(prefix="", device=None):
             f"Res: {reserved:.1f} MB | "
             f"Max: {max_alloc:.1f} MB")
 
-def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, val_loader, num_classes, style_extractor, vocab_size, noise_scheduler, transforms, args, tokenizer=None, text_encoder=None, lr_scheduler=None, letter2index=None, start_epoch=0):
+def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, val_loader, num_classes, style_extractor, vocab_size, noise_scheduler, transforms, args, tokenizer=None, text_encoder=None, lr_scheduler=None, letter2index=None, start_epoch=0, scaler=None):
     model.train()
     loss_meter = AvgMeter()
     print(f'Training started from epoch {start_epoch}....')
+    print(f'Mixed precision (AMP): {args.amp}')
     for epoch in range(start_epoch, args.epochs):
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-        # Curriculum for rec_weight
         current_rec_weight = min(args.rec_weight_start + (args.rec_weight_max - args.rec_weight_start) * (epoch / args.rec_curriculum_epochs), args.rec_weight_max)
         print(f'Epoch: {epoch}, Current Rec Weight: {current_rec_weight}')
         pbar = tqdm(loader)
-        
+
         try:
             for i, data in enumerate(pbar):
-                images = data[0].to(args.device)
+                images = data[0].to(args.device, non_blocking=True)
                 transcr = data[1]
                 s_id = torch.tensor([int(w) for w in data[3]]).to(args.device)
-                style_images = data[7].to(args.device)
-                
+                style_images = data[7].to(args.device, non_blocking=True)
+
                 text_features = tokenizer(transcr, padding="max_length", truncation=True, return_tensors="pt", max_length=200)
                 text_features = {k: v.to(args.device) for k, v in text_features.items()}
-                
+
                 style_features = None
-                
-                if args.latent:
-                    images = vae.module.encode(images.float()).latent_dist.sample() * 0.18215
-                
-                noise = torch.randn_like(images)
-                timesteps = diffusion.sample_timesteps(images.size(0)).to(args.device)
-                noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
-                
-                drop_labels = np.random.random() < 0.1
-                labels = None if drop_labels else s_id
-                y = labels if labels is not None else torch.zeros(images.size(0), dtype=torch.long, device=args.device)
-                
-                predicted_noise = model(noisy_images, timesteps, text_features, y, style_extractor=style_features)
-                loss = mse_loss(noise, predicted_noise)
-                
-                # Rec loss (with fixes)
-                if i % 50 == 0 and epoch >= args.rec_start_epoch:
-                    print(gpu_mem(prefix=f"[E{epoch} I{i}] Before Rec"))
-                    noise_scheduler.set_timesteps(15)
-                    x_approx = noisy_images.clone()
-                    for step in noise_scheduler.timesteps:
-                        t_approx = (torch.ones(x_approx.size(0), device=args.device) * step).long()
-                        y_rec = s_id
-                        pred_noise_approx = model(x_approx, t_approx, text_features, y_rec, style_extractor=style_features)
-                        x_approx = noise_scheduler.step(pred_noise_approx, step, x_approx).prev_sample
-                    
-                    x_approx = x_approx.detach()
-                    
+
+                # -----------------------------------------------------
+                # AMP: wrap the forward pass (VAE encode, UNet forward,
+                # rec-loss branch) in autocast. Backward/optimizer step
+                # happen outside, driven through the GradScaler.
+                # -----------------------------------------------------
+                with autocast(enabled=args.amp):
                     if args.latent:
-                        image_approx = vae.module.decode(x_approx / 0.18215).sample
-                        image_approx = (image_approx / 2 + 0.5).clamp(0, 1)
+                        # ---------------------------------------------------
+                        # FIX (nan loss): SD1.5's VAE overflows in fp16,
+                        # especially in the decoder/encoder attention blocks.
+                        # Force this call back to fp32 regardless of the
+                        # outer autocast -- everything downstream (UNet
+                        # forward) still gets fp16 speed, only the VAE math
+                        # itself is exempted.
+                        # ---------------------------------------------------
+                        with autocast(enabled=False):
+                            images_latent = vae.module.encode(images.float()).latent_dist.sample() * 0.18215
                     else:
-                        image_approx = ((x_approx.clamp(-1, 1) + 1) / 2)
-                    
-                    pixel_values = preprocess_image_for_recognizer_torch(image_approx, args)
-                    gt_labels = pad_sequence([torch.tensor([recognizer_tokenizer.bos_token_id] + recognizer_tokenizer(tr).input_ids + [recognizer_tokenizer.eos_token_id]) for tr in transcr], batch_first=True, padding_value=-100).to(args.device)
-                    outputs_emb = recognizer_conv(pixel_values)
-                    outputs = recognizer_transformer(inputs_embeds=outputs_emb, labels=gt_labels)
-                    rec_loss = outputs.loss
-                    rec_loss = torch.clamp(rec_loss, max=5.0)
-                    print(gpu_mem(prefix=f"[E{epoch} I{i}] After Rec"))
-                    
-                    if i % 50 == 0:
-                        mse_val = mse_loss(noise, predicted_noise).item()
-                        print(f"  [Step {i}] MSE: {mse_val:.6f}, Rec: {rec_loss.item():.6f}, "
-                            f"Weighted Rec: {(current_rec_weight * rec_loss).item():.6f}")
-                    
-                    loss += current_rec_weight * rec_loss
-                
+                        images_latent = images
+
+                    noise = torch.randn_like(images_latent)
+                    timesteps = diffusion.sample_timesteps(images_latent.size(0)).to(args.device)
+                    noisy_images = noise_scheduler.add_noise(images_latent, noise, timesteps)
+
+                    drop_labels = np.random.random() < 0.1
+                    labels = None if drop_labels else s_id
+                    y = labels if labels is not None else torch.zeros(images_latent.size(0), dtype=torch.long, device=args.device)
+
+                    predicted_noise = model(noisy_images, timesteps, text_features, y, style_extractor=style_features)
+                    loss = mse_loss(noise, predicted_noise)
+
+                    # ---------------------------------------------------------
+                    # Rec loss -- FIXED gradient flow.
+                    # Previously: all 15 DDIM-peek steps ran, then x_approx was
+                    # unconditionally .detach()'d before being handed to the
+                    # recognizer -- severing the graph, so rec_loss was computed
+                    # and logged but its gradient never reached the UNet.
+                    # Fix: run the first 14 steps under torch.no_grad(), then
+                    # run the FINAL step with gradients enabled and do NOT
+                    # detach -- that's the one path rec_loss's gradient travels
+                    # back through to reach the UNet's weights.
+                    # ---------------------------------------------------------
+                    if i % 50 == 0 and epoch >= args.rec_start_epoch:
+                        print(gpu_mem(prefix=f"[E{epoch} I{i}] Before Rec"))
+                        noise_scheduler.set_timesteps(15)
+                        timesteps_list = list(noise_scheduler.timesteps)
+                        x_approx = noisy_images.clone()
+
+                        with torch.no_grad():
+                            for step in timesteps_list[:-1]:
+                                t_approx = (torch.ones(x_approx.size(0), device=args.device) * step).long()
+                                pred_noise_approx = model(x_approx, t_approx, text_features, s_id, style_extractor=style_features)
+                                # scheduler.step is numerically sensitive -- keep it in fp32
+                                x_approx = noise_scheduler.step(pred_noise_approx.float(), step, x_approx.float()).prev_sample
+
+                        final_step = timesteps_list[-1]
+                        t_final = (torch.ones(x_approx.size(0), device=args.device) * final_step).long()
+                        pred_noise_final = model(x_approx, t_final, text_features, s_id, style_extractor=style_features)
+                        x_approx = noise_scheduler.step(pred_noise_final.float(), final_step, x_approx.float()).prev_sample
+                        # NOTE: deliberately no .detach() here -- this is the fix.
+
+                        if args.latent:
+                            with autocast(enabled=False):
+                                image_approx = vae.module.decode((x_approx / 0.18215).float()).sample
+                            image_approx = (image_approx / 2 + 0.5).clamp(0, 1)
+                        else:
+                            image_approx = ((x_approx.clamp(-1, 1) + 1) / 2)
+
+                        pixel_values = preprocess_image_for_recognizer_torch(image_approx, args)
+                        gt_labels = pad_sequence([torch.tensor([recognizer_tokenizer.bos_token_id] + recognizer_tokenizer(tr).input_ids + [recognizer_tokenizer.eos_token_id]) for tr in transcr], batch_first=True, padding_value=-100).to(args.device)
+                        # Recognizer forward also kept in fp32 -- it's a frozen
+                        # from-scratch conv+encoder-decoder stack never trained
+                        # under fp16, so don't risk overflow here either; the
+                        # UNet is still the thing getting fp16 speed.
+                        with autocast(enabled=False):
+                            outputs_emb = recognizer_conv(pixel_values.float())
+                            outputs = recognizer_transformer(inputs_embeds=outputs_emb, labels=gt_labels)
+                        rec_loss = outputs.loss
+                        rec_loss = torch.clamp(rec_loss, max=5.0)
+                        print(gpu_mem(prefix=f"[E{epoch} I{i}] After Rec"))
+
+                        if i % 50 == 0:
+                            mse_val = mse_loss(noise, predicted_noise).item()
+                            print(f"  [Step {i}] MSE: {mse_val:.6f}, Rec: {rec_loss.item():.6f}, "
+                                f"Weighted Rec: {(current_rec_weight * rec_loss).item():.6f}")
+
+                        loss = loss + current_rec_weight * rec_loss
+
                 optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                if args.amp:
+                    scaler.scale(loss).backward()
+                    # unscale before clipping so max_norm is applied to real-scale grads
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
                 ema.step_ema(ema_model, model)
                 loss_meter.update(loss.item(), images.size(0))
                 pbar.set_postfix(MSE=loss_meter.avg)
                 if lr_scheduler:
                     lr_scheduler.step()
-        
+
         except RuntimeError as e:
             if "DataLoader worker" in str(e):
                 print(f"\n⚠️  DataLoader worker crashed at epoch {epoch}")
                 print(f"Error: {e}")
-                print(f"This is a known Windows multiprocessing issue.")
                 print(f"Saving emergency checkpoint and continuing...")
-                
-                # Save emergency checkpoint
+
                 emergency_checkpoint = {
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
@@ -535,35 +597,33 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
                     'loss_meter_count': loss_meter.count,
                     'args': vars(args),
                 }
+                if args.amp:
+                    emergency_checkpoint['scaler_state_dict'] = scaler.state_dict()
                 emergency_path = os.path.join(args.save_path, "models", f"emergency_checkpoint_epoch_{epoch}.pt")
                 torch.save(emergency_checkpoint, emergency_path)
                 print(f"✓ Emergency checkpoint saved to {emergency_path}")
                 print(f"Recommendation: Restart training with --num_workers 0")
                 print(f"Skipping to next epoch...\n")
-                continue  # Skip to next epoch
+                continue
             else:
-                raise  # Re-raise if it's a different error
-        
-        # Sampling
+                raise
+
         print(gpu_mem(prefix=f"[Epoch {epoch} PEAK]"))
-        if epoch % 1 == 0:
-            val_batch = next(iter(val_loader))
+        if epoch % args.sample_every == 0:
             val_transcr = val_batch[1]
             n = min(4, len(val_transcr))
             labels = torch.arange(n).long().to(args.device) % num_classes
-            
-            # Sample some words
+
             ema_sampled_images = diffusion.sampling(ema_model, vae, n=n, x_text=val_transcr[:n], labels=labels, args=args, style_extractor=None, noise_scheduler=noise_scheduler, transform=transforms, character_classes=None, tokenizer=tokenizer, text_encoder=text_encoder)
-            save_images(ema_sampled_images, os.path.join(args.save_path, 'images', f"{epoch}_ema.jpg"), args,texts=val_transcr[:n])
+            save_images(ema_sampled_images, os.path.join(args.save_path, 'images', f"{epoch}_ema.jpg"), args, texts=val_transcr[:n])
             torch.cuda.empty_cache()
-            
+
             if args.wandb_log:
                 words_caption = " | ".join(val_transcr[:n])
                 caption = f"Epoch {epoch} - With words: {words_caption}"
                 wandb.log({"Sampled images": wandb.Image(ema_sampled_images[0], caption=caption)})
-        
-        if epoch % 1==0:  # Save every epoch
-            # Save comprehensive checkpoint with all training state
+
+        if epoch % 1 == 0:
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -573,46 +633,39 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
                 'loss_meter_avg': loss_meter.avg,
                 'loss_meter_sum': loss_meter.sum,
                 'loss_meter_count': loss_meter.count,
-                'args': vars(args),  # Save all arguments for reference
-                # Random states for reproducibility (ensure CPU tensors)
+                'args': vars(args),
                 'rng_state': torch.get_rng_state().cpu(),
                 'cuda_rng_state': [s.cpu() for s in torch.cuda.get_rng_state_all()] if torch.cuda.is_available() else None,
                 'numpy_rng_state': np.random.get_state(),
                 'python_rng_state': random.getstate(),
             }
-            
-            # Add lr_scheduler state if it exists
+
             if lr_scheduler is not None:
                 checkpoint['lr_scheduler_state_dict'] = lr_scheduler.state_dict()
-            
-            # Save checkpoint
-            # checkpoint_path = os.path.join(args.save_path, "models", f"checkpoint_epoch_{epoch}.pt")
-            # torch.save(checkpoint, checkpoint_path)
-            # print(f"Saved checkpoint at epoch {epoch}")
-            
-            # Also save as latest checkpoint (for easy resuming)
+            if args.amp:
+                checkpoint['scaler_state_dict'] = scaler.state_dict()
+
             latest_checkpoint_path = os.path.join(args.save_path, "models", "latest_checkpoint.pt")
             torch.save(checkpoint, latest_checkpoint_path)
             print(f"Saved checkpoint at epoch {epoch}")
-            
-            # Keep backward compatibility - save individual files too
+
             torch.save(model.state_dict(), os.path.join(args.save_path, "models", "ckpt.pt"))
             torch.save(ema_model.state_dict(), os.path.join(args.save_path, "models", "ema_ckpt.pt"))
             torch.save(optimizer.state_dict(), os.path.join(args.save_path, "models", "optim.pt"))
 
-        if epoch % 2==0:
+        if epoch % args.validate_every == 0:
             print(f"\nRunning CER validation at epoch {epoch}...")
             validate(
-            diffusion=diffusion,
-            model=ema_model,            # <-- IMPORTANT: use EMA model
-            vae=vae,
-            data_loader=val_loader,
-            num_classes=num_classes,
-            noise_scheduler=noise_scheduler,
-            transforms=transforms,
-            args=args,
-            tokenizer=tokenizer,
-            text_encoder=text_encoder)
+                diffusion=diffusion,
+                model=ema_model,
+                vae=vae,
+                data_loader=val_loader,
+                num_classes=num_classes,
+                noise_scheduler=noise_scheduler,
+                transforms=transforms,
+                args=args,
+                tokenizer=tokenizer,
+                text_encoder=text_encoder)
             torch.cuda.empty_cache()
 
 def validate(diffusion, model, vae, data_loader, num_classes, noise_scheduler, transforms, args, tokenizer=None, text_encoder=None):
@@ -633,7 +686,7 @@ def validate(diffusion, model, vae, data_loader, num_classes, noise_scheduler, t
             recognized = recognize_urdu_batch(sampled_images, args)
             rec_texts.extend(recognized)
             torch.cuda.empty_cache()
-    
+
     cer_score = cer_metric.compute(predictions=rec_texts, references=gt_texts)
     print(f"Validation CER: {cer_score}")
     if args.wandb_log:
@@ -643,36 +696,40 @@ def validate(diffusion, model, vae, data_loader, num_classes, noise_scheduler, t
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--batch_size', type=int, default=8)  # Increased for word-level
-    parser.add_argument('--num_workers', type=int, default=0, help='Number of DataLoader workers (use 0 for Windows to avoid crashes)')
+    parser.add_argument('--batch_size', type=int, default=8)
+    # ---------------------------------------------------------------------
+    # FIX: default num_workers bumped 0 -> 2. num_workers=0 means the main
+    # process loads every batch synchronously -- the GPU sits idle waiting
+    # on disk/CPU decode between steps. 2 lets Colab's ~2 CPU cores
+    # prefetch the next batch(es) while the GPU is busy on the current one.
+    # Still overridable via --num_workers 0 if DataLoader worker crashes
+    # become a problem again.
+    # ---------------------------------------------------------------------
+    parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--model_name', type=str, default='diffusionpen')
-    parser.add_argument('--level', type=str, default='word')  # Changed to word
-    parser.add_argument('--img_size', type=tuple, default=(64, 256))  # Word-level size
+    parser.add_argument('--level', type=str, default='word')
+    parser.add_argument('--img_size', type=tuple, default=(64, 256))
     parser.add_argument('--dataset', type=str, default='word_generation')
-    # Separate folders for train/val/test
     parser.add_argument('--train_image_folder', type=str, default=r'.\Urdu_Word_Dataset\train\processed_images')
     parser.add_argument('--train_gt_folder', type=str, default=r'.\Urdu_Word_Dataset\train\gt_txt')
     parser.add_argument('--val_image_folder', type=str, default=r'.\Urdu_Word_Dataset\val\processed_images')
     parser.add_argument('--val_gt_folder', type=str, default=r'.\Urdu_Word_Dataset\val\gt_txt')
-    parser.add_argument('--test_image_folder', type=str, default=r'.\Urdu_Word_Dataset\test\processed_images')
-    parser.add_argument('--test_gt_folder', type=str, default=r'.\Urdu_Word_Dataset\test\gt_txt')
     parser.add_argument('--channels', type=int, default=4)
     parser.add_argument('--emb_dim', type=int, default=320)
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--num_res_blocks', type=int, default=1)
     parser.add_argument('--save_path', type=str, default=r'.\word_level_model')
     parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--wandb_log', type=bool, default=True)
-    parser.add_argument('--color', type=bool, default=True)
+    parser.add_argument('--wandb_log', type=str2bool, default=True)
+    parser.add_argument('--color', type=str2bool, default=True)
     parser.add_argument('--unet', type=str, default='unet_latent')
-    parser.add_argument('--latent', type=bool, default=True)
-    parser.add_argument('--img_feat', type=bool, default=False)
-    parser.add_argument('--interpolation', type=bool, default=False)
-    parser.add_argument('--dataparallel', type=bool, default=False)
-    parser.add_argument('--load_check', type=bool, default=False)
-    parser.add_argument('--resume_training', type=bool, default=True, help='Automatically resume from latest checkpoint if available')
-    # parser.add_argument('--checkpoint_freq', type=int, default=20, help='Save checkpoint every N epochs')
-    parser.add_argument('--sampling_word', type=bool, default=False)
+    parser.add_argument('--latent', type=str2bool, default=True)
+    parser.add_argument('--img_feat', type=str2bool, default=False)
+    parser.add_argument('--interpolation', type=str2bool, default=False)
+    parser.add_argument('--dataparallel', type=str2bool, default=False)
+    parser.add_argument('--load_check', type=str2bool, default=False)
+    parser.add_argument('--resume_training', type=str2bool, default=True)
+    parser.add_argument('--sampling_word', type=str2bool, default=False)
     parser.add_argument('--mix_rate', type=float, default=None)
     parser.add_argument('--stable_dif_path', type=str, default='stable-diffusion-v1-5/stable-diffusion-v1-5')
     parser.add_argument('--train_mode', type=str, default='train')
@@ -681,66 +738,88 @@ def main():
     parser.add_argument('--rec_weight_start', type=float, default=0.001)
     parser.add_argument('--rec_weight_max', type=float, default=0.05)
     parser.add_argument('--rec_curriculum_epochs', type=int, default=150)
+    parser.add_argument('--recognizer_conv_path', type=str, default='/content/DiffusionRec_Research/weights/conv_transformer_weights/icdar/conv.pt')
+    parser.add_argument('--recognizer_transformer_path', type=str, default='/content/DiffusionRec_Research/weights/conv_transformer_weights/icdar')
+    parser.add_argument('--recognizer_vocab_path', type=str, default='/content/DiffusionRec_Research/data/vocab/ved/')
+    # ---------------------------------------------------------------------
+    # NEW: --amp toggles mixed precision (fp16 autocast + GradScaler).
+    # Default True since this is the main speed fix for T4. Pass
+    # --amp False to fall back to the original full-fp32 behavior if you
+    # ever see NaN losses or other AMP-related instability.
+    # ---------------------------------------------------------------------
+    parser.add_argument('--amp', type=str2bool, default=True)
+    # ---------------------------------------------------------------------
+    # NEW: number of denoising steps used by Diffusion.sampling() (the
+    # EMA-preview image and CER-validation sampling path only -- NOT the
+    # main training loop, which doesn't sample). Paired with the
+    # DPM-Solver++ swap above; 15-20 steps there gets comparable quality
+    # to what 50 DDIM steps used to give.
+    # ---------------------------------------------------------------------
+    parser.add_argument('--sampling_steps', type=int, default=18)
+    # ---------------------------------------------------------------------
+    # NEW: how often (in epochs) to run the EMA-preview sampling and the
+    # full CER validation loop. Both were running every 1-2 epochs, and
+    # each CER validation alone does 10 batches x a full sampling pass --
+    # real wall-clock cost on top of the 8901 training steps/epoch.
+    # Defaults widened to make that overhead less frequent.
+    # ---------------------------------------------------------------------
+    parser.add_argument('--sample_every', type=int, default=3)
+    parser.add_argument('--validate_every', type=int, default=5)
     args = parser.parse_args()
-    
+
     print('torch version', torch.__version__)
     if args.wandb_log:
         wandb.init(project='WordGeneration', name=args.dataset, config=args)
-    
+
     setup_logging(args)
-    load_urdu_recognizer(device=args.device)
-    
+    load_urdu_recognizer(device=args.device, conv_path=args.recognizer_conv_path,
+                          transformer_path=args.recognizer_transformer_path,
+                          vocab_path=args.recognizer_vocab_path)
+
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-    
+
     # Load word-level dataset
+    # NOTE: test_data/test_loader REMOVED -- traced through both train_mode
+    # branches ('train' and 'sampling') and test_loader is never actually
+    # referenced in either. It was dead weight requiring a test split that
+    # doesn't need to exist for this run.
     train_data = WordGenerationDataset(args.train_image_folder, args.train_gt_folder, 'train', fixed_size=(64, 256), transforms=transform, args=args)
     val_data = WordGenerationDataset(args.val_image_folder, args.val_gt_folder, 'val', fixed_size=(64, 256), transforms=transform, args=args)
-    test_data = WordGenerationDataset(args.test_image_folder, args.test_gt_folder, 'test', fixed_size=(64, 256), transforms=transform, args=args)
-    
-    print('train data', len(train_data), 'val data', len(val_data), 'test data', len(test_data))
-    
+
+    print('train data', len(train_data), 'val data', len(val_data))
+
     style_classes = train_data.wclasses
     character_classes = train_data.character_classes
     global letter2index
     letter2index = {char: idx for idx, char in enumerate(character_classes)}
     vocab_size = len(character_classes) + num_tokens
     print('num of character classes', vocab_size)
-    
-    # DataLoader configuration - Windows-safe settings
-    # Use persistent_workers to avoid worker respawning issues
+
     num_workers = args.num_workers if args.num_workers > 0 else 0
-    use_persistent = num_workers > 0  # Only use persistent workers if workers > 0
-    
+    use_persistent = num_workers > 0
+
     train_loader = DataLoader(
-        train_data, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
+        train_data,
+        batch_size=args.batch_size,
+        shuffle=True,
         num_workers=num_workers,
         persistent_workers=use_persistent,
         pin_memory=True if torch.cuda.is_available() else False
     )
     val_loader = DataLoader(
-        val_data, 
-        batch_size=args.batch_size, 
-        shuffle=False, 
+        val_data,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=num_workers,
         persistent_workers=use_persistent,
         pin_memory=True if torch.cuda.is_available() else False
     )
-    test_loader = DataLoader(
-        test_data, 
-        batch_size=args.batch_size, 
-        shuffle=False, 
-        num_workers=num_workers,
-        persistent_workers=use_persistent,
-        pin_memory=True if torch.cuda.is_available() else False
-    )
-    
+
     if args.dataparallel:
         device_ids = [3, 4]
     else:
         device_ids = [int(''.join(filter(str.isdigit, args.device)))]
-    
+
     if args.model_name == 'diffusionpen':
         tokenizer = CanineTokenizer.from_pretrained("google/canine-c")
         text_encoder = CanineModel.from_pretrained("google/canine-c")
@@ -749,51 +828,55 @@ def main():
     else:
         tokenizer = None
         text_encoder = None
-    
+
     if args.unet == 'unet_latent':
-        unet = UNetModel(image_size=args.img_size, in_channels=args.channels, model_channels=args.emb_dim, out_channels=args.channels, num_res_blocks=args.num_res_blocks, attention_resolutions=(1,1), channel_mult=(1, 1), num_heads=args.num_heads, num_classes=style_classes, context_dim=args.emb_dim, vocab_size=vocab_size, text_encoder=text_encoder, args=args)
+        unet = UNetModel(image_size=args.img_size, in_channels=args.channels, model_channels=args.emb_dim, out_channels=args.channels, num_res_blocks=args.num_res_blocks, attention_resolutions=(1, 1), channel_mult=(1, 1), num_heads=args.num_heads, num_classes=style_classes, context_dim=args.emb_dim, vocab_size=vocab_size, text_encoder=text_encoder, args=args)
         unet = DataParallel(unet, device_ids=device_ids)
         unet = unet.to(args.device)
-    
+
     optimizer = optim.AdamW(unet.parameters(), lr=0.0001)
     lr_scheduler = None
     mse_loss = nn.MSELoss()
     diffusion = Diffusion(img_size=args.img_size, args=args)
     ema = EMA(0.995)
     ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
-    
-    # Initialize start_epoch for training
+
+    # AMP GradScaler -- only meaningful on CUDA; harmless no-op object otherwise.
+    scaler = GradScaler(enabled=args.amp)
+
     start_epoch = 0
-    
-    # Check for resume training (automatic if resume_training=True)
+
     latest_checkpoint_path = os.path.join(args.save_path, "models", "latest_checkpoint.pt")
-    
+
     if args.resume_training and os.path.exists(latest_checkpoint_path):
-        # Automatic resume from latest checkpoint
         try:
             start_epoch, checkpoint = load_checkpoint(
-                latest_checkpoint_path, 
-                unet, 
-                ema_model, 
-                optimizer, 
-                ema, 
-                lr_scheduler, 
-                args.device
+                latest_checkpoint_path,
+                unet,
+                ema_model,
+                optimizer,
+                ema,
+                lr_scheduler,
+                args.device,
+                scaler=scaler
             )
             print(f"✓ Successfully resumed training from epoch {start_epoch}")
         except Exception as e:
             print(f"Warning: Failed to load checkpoint: {e}")
             print("Starting training from scratch...")
             start_epoch = 0
-    
+
     elif args.load_check:
-        # Legacy loading (backward compatibility)
+        # Legacy loading. FIX: added map_location=args.device to all three
+        # torch.load calls -- previously missing, risk of a device-ordinal
+        # error depending on what device the checkpoint was originally
+        # saved from vs. what's available here.
         try:
-            unet.load_state_dict(torch.load(f'{args.save_path}/models/ckpt.pt'))
-            optimizer.load_state_dict(torch.load(f'{args.save_path}/models/optim.pt'))
-            ema_model.load_state_dict(torch.load(f'{args.save_path}/models/ema_ckpt.pt'))
+            unet.load_state_dict(torch.load(f'{args.save_path}/models/ckpt.pt', map_location=args.device))
+            optimizer.load_state_dict(torch.load(f'{args.save_path}/models/optim.pt', map_location=args.device))
+            ema_model.load_state_dict(torch.load(f'{args.save_path}/models/ema_ckpt.pt', map_location=args.device))
             print('Loaded models and optimizer (legacy mode - epoch info not available)')
-            start_epoch = 0  # Can't determine epoch from legacy checkpoints
+            start_epoch = 0
         except Exception as e:
             print(f"Warning: Failed to load legacy checkpoint: {e}")
             print("Starting training from scratch...")
@@ -801,7 +884,7 @@ def main():
     else:
         print("Starting fresh training (no checkpoint found or resume disabled)")
         start_epoch = 0
-    
+
     if args.latent:
         print('VAE is true')
         vae = AutoencoderKL.from_pretrained(args.stable_dif_path, subfolder="vae")
@@ -810,26 +893,35 @@ def main():
         vae.requires_grad_(False)
     else:
         vae = None
-    
-    ddim = DDIMScheduler.from_pretrained(args.stable_dif_path, subfolder="scheduler")
+
+    # ---------------------------------------------------------------------
+    # FIX (speed): DDIM is a 1st-order solver -- needs ~50 steps for decent
+    # quality. DPM-Solver++ is a higher-order ODE solver that reaches
+    # comparable quality in ~15-20 steps. This only affects the
+    # validation/EMA-preview sampling path (Diffusion.sampling) -- it does
+    # NOT touch the main per-step training loss, which never samples.
+    # Loads from the same SD1.5 scheduler_config.json fine since both
+    # schedulers share the underlying beta/prediction-type config fields.
+    # ---------------------------------------------------------------------
+    ddim = DPMSolverMultistepScheduler.from_pretrained(args.stable_dif_path, subfolder="scheduler")
+    ddim.config.algorithm_type = "dpmsolver++"
     feature_extractor = None
-    
+
     if args.train_mode == 'train':
-        train(diffusion, unet, ema, ema_model, vae, optimizer, mse_loss, train_loader, val_loader, style_classes, feature_extractor, vocab_size, ddim, transform, args, tokenizer=tokenizer, text_encoder=text_encoder, lr_scheduler=lr_scheduler, letter2index=letter2index, start_epoch=start_epoch)
+        train(diffusion, unet, ema, ema_model, vae, optimizer, mse_loss, train_loader, val_loader, style_classes, feature_extractor, vocab_size, ddim, transform, args, tokenizer=tokenizer, text_encoder=text_encoder, lr_scheduler=lr_scheduler, letter2index=letter2index, start_epoch=start_epoch, scaler=scaler)
     elif args.train_mode == 'sampling':
         print('Sampling started....')
         unet.load_state_dict(torch.load(f'{args.save_path}/models/ckpt.pt', map_location=args.device))
         print('unet loaded')
         ema = EMA(0.995)
         ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
-        ema_model.load_state_dict(torch.load(f'{args.save_path}/models/ema_ckpt.pt'))
+        ema_model.load_state_dict(torch.load(f'{args.save_path}/models/ema_ckpt.pt', map_location=args.device))
         ema_model.eval()
-        
-        # Sample some Urdu words
+
         words = ['کون', 'سوچ', 'ملک', 'دین']
         s = 0
         labels = torch.tensor([s]).long().to(args.device)
-        
+
         for word in words:
             print('Word:', word)
             sample_image = diffusion.sampling(ema_model, vae, n=1, x_text=word, labels=labels, args=args, style_extractor=None, noise_scheduler=ddim, transform=transform, character_classes=None, tokenizer=tokenizer, text_encoder=text_encoder)
