@@ -610,6 +610,7 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
 
         print(gpu_mem(prefix=f"[Epoch {epoch} PEAK]"))
         if epoch % args.sample_every == 0:
+            val_batch = next(iter(val_loader))
             val_transcr = val_batch[1]
             n = min(4, len(val_transcr))
             labels = torch.arange(n).long().to(args.device) % num_classes
