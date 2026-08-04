@@ -1,0 +1,516 @@
+"""
+screening_diagnostic.py
+
+Cheap, fast diagnostic to test whether the recognition-loss gradient fix
+actually moves recognition accuracy, before committing to full 71k-word
+training runs.
+
+Design (see DiffusionRec_Recognition_Gap diagnostic doc):
+  - Train on a SMALL rotating subset of the training pool (not the full
+    71,207 words) -- subset is resampled every --rotate_every epochs so no
+    single image gets memorized via repeated exposure across the whole run.
+  - Recognition-loss curriculum is cranked aggressively (--rec_weight_start,
+    --rec_weight_max, --rec_curriculum_epochs, --rec_start_epoch=0) on
+    purpose -- this is a diagnostic config, not a realistic training recipe.
+  - Held-out eval words are a set of words EXCLUDED from the training pool
+    entirely (not just a held-out split of the subset), so eval measures
+    generalization, not memorization.
+  - --control lets you flip back to the OLD (broken/detached) gradient path
+    so you can run a same-subset, same-curriculum control and isolate
+    whether it's really the fix doing the work, not just aggressive loss
+    weighting perturbing training.
+
+Paths below match the repo layout:
+  training/active/train_word_level_with_resume_v2.py  -- main training script
+  inference/active/qwen_eval.py                        -- Qwen3-VL OCR eval harness
+
+Run with --qwen_checkpoint pointing at your fine-tuned Qwen3-VL weights to get
+real Rec.Acc./CER numbers; without it, eval images + manifests are still saved
+to disk each eval pass, just not scored.
+"""
+
+import os
+import sys
+import csv
+import json
+import random
+import argparse
+import copy
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch import optim
+from torch.utils.data import DataLoader, Subset
+from torchvision import transforms
+from torchvision.transforms import ToPILImage
+from tqdm import tqdm
+from diffusers import AutoencoderKL, DPMSolverMultistepScheduler
+from transformers import CanineModel, CanineTokenizer
+from torch.nn import DataParallel
+
+REPO_ROOT = '/content/DiffusionRec_Research'
+
+# --- main training script (training/active/train_word_level_with_resume_v2.py) ---
+sys.path.append(os.path.join(REPO_ROOT, 'training', 'active'))
+TRAIN_MODULE = 'train_word_level_with_resume_v2'
+_train_mod = __import__(TRAIN_MODULE)
+str2bool = _train_mod.str2bool
+setup_logging = _train_mod.setup_logging
+save_images = _train_mod.save_images
+AvgMeter = _train_mod.AvgMeter
+EMA = _train_mod.EMA
+Diffusion = _train_mod.Diffusion
+load_urdu_recognizer = _train_mod.load_urdu_recognizer
+recognize_urdu_batch = _train_mod.recognize_urdu_batch
+preprocess_image_for_recognizer_torch = _train_mod.preprocess_image_for_recognizer_torch
+load_checkpoint = _train_mod.load_checkpoint
+gpu_mem = _train_mod.gpu_mem
+from models.unet import UNetModel
+from data.utils.word_generation_dataset import WordGenerationDataset
+from torch.nn.utils.rnn import pad_sequence
+from torch.amp import autocast as _autocast, GradScaler as _GradScaler
+
+# --- Qwen OCR eval harness (inference/active/qwen_eval.py) ---
+sys.path.append(os.path.join(REPO_ROOT, 'inference', 'active'))
+import qwen_eval
+
+_to_pil = ToPILImage()
+
+
+def autocast(enabled=True):
+    return _autocast('cuda', enabled=enabled)
+
+
+def GradScaler(enabled=True):
+    return _GradScaler('cuda', enabled=enabled)
+
+
+# ---------------------------------------------------------------------------
+# Word-index construction: maps word -> list of dataset indices, so we can
+# (a) carve out a held-out vocabulary excluded from training entirely, and
+# (b) sample rotating training subsets from the remaining pool.
+# Tries cheap attribute access first; falls back to a one-time full pass
+# (cached to disk afterward so you only pay this cost once).
+# ---------------------------------------------------------------------------
+_CANDIDATE_ATTRS = ['transcrs', 'words', 'gt_texts', 'transcriptions',
+                     'labels_text', 'wordsList', 'gt_list', 'texts']
+
+
+def build_word_index(dataset, cache_path):
+    if os.path.exists(cache_path):
+        print(f"Loading cached word index from {cache_path}")
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    for attr in _CANDIDATE_ATTRS:
+        if hasattr(dataset, attr):
+            values = getattr(dataset, attr)
+            if len(values) == len(dataset):
+                print(f"Using dataset.{attr} for word index (fast path)")
+                word_index = {}
+                for i, w in enumerate(values):
+                    word_index.setdefault(w, []).append(i)
+                with open(cache_path, 'w', encoding='utf-8') as f:
+                    json.dump(word_index, f, ensure_ascii=False)
+                return word_index
+
+    print("No word-list attribute found on dataset -- doing a one-time full "
+          f"pass over {len(dataset)} items to build the word index. This is "
+          "slow but only happens once (cached afterward).")
+    word_index = {}
+    for i in tqdm(range(len(dataset)), desc="Indexing words"):
+        w = dataset[i][1]
+        word_index.setdefault(w, []).append(i)
+    with open(cache_path, 'w', encoding='utf-8') as f:
+        json.dump(word_index, f, ensure_ascii=False)
+    return word_index
+
+
+def split_pool_and_holdout(word_index, held_out_words, seed):
+    rng = random.Random(seed)
+    all_words = list(word_index.keys())
+    rng.shuffle(all_words)
+    if held_out_words > len(all_words):
+        raise ValueError(f"held_out_words ({held_out_words}) > vocab size ({len(all_words)})")
+
+    held_out_vocab = all_words[:held_out_words]
+    pool_vocab = all_words[held_out_words:]
+
+    held_out_indices = [i for w in held_out_vocab for i in word_index[w]]
+    pool_indices = [i for w in pool_vocab for i in word_index[w]]
+
+    print(f"Held-out vocab: {len(held_out_vocab)} words / {len(held_out_indices)} images "
+          f"(excluded from training entirely)")
+    print(f"Training pool: {len(pool_vocab)} words / {len(pool_indices)} images")
+    return pool_indices, held_out_vocab, held_out_indices
+
+
+def sample_training_subset(pool_indices, subset_size, rng):
+    size = min(subset_size, len(pool_indices))
+    return rng.sample(pool_indices, size)
+
+
+def run_qwen_eval(images, words, qwen_model, qwen_processor, qwen_prompt, args, out_dir, tag):
+    """
+    Real integration with inference/active/qwen_eval.py.
+
+    qwen_eval.evaluate() works off a manifest CSV of (image_path, ground_truth)
+    pairs read from disk -- it's not built to accept in-memory tensors -- so
+    we save each generated sample as a PNG, write a manifest, and call it the
+    same way you'd run it on real held-out test images. This means diagnostic
+    numbers are produced by the exact same scoring code as your paper-baseline
+    calibration runs, which is the whole point of reusing it.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    img_dir = os.path.join(out_dir, tag)
+    os.makedirs(img_dir, exist_ok=True)
+
+    # keep the quick visual grid for eyeballing, same as before
+    save_images(images, os.path.join(out_dir, f"{tag}_grid.jpg"), args, texts=words)
+
+    manifest_path = os.path.join(out_dir, f"{tag}_manifest.csv")
+    with open(manifest_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['image_path', 'ground_truth'])
+        pil_images = [_to_pil(img.detach().cpu().clamp(0, 1)) for img in images]
+        for idx, (pil_img, word) in enumerate(zip(pil_images, words)):
+            img_path = os.path.join(img_dir, f"{idx:03d}.png")
+            pil_img.save(img_path)
+            writer.writerow([img_path, word])
+
+    if qwen_model is None:
+        print(f"  [WARN] --qwen_checkpoint not set -- skipping quantitative score "
+              f"for '{tag}'. Images + manifest saved to {img_dir} for manual "
+              f"inspection or a later qwen_eval.py run.")
+        return None
+
+    out_csv = os.path.join(out_dir, f"{tag}_predictions.csv")
+    result = qwen_eval.evaluate(manifest_path, qwen_model, qwen_processor, qwen_prompt, out_csv)
+    print(f"  [{tag}] exact_match={result['exact_match_accuracy']*100:.2f}% "
+          f"CER={result['cer']*100:.2f}% Rec.Acc.(1-CER)={result['rec_acc_1_minus_cer']*100:.2f}%")
+    return result
+
+
+def evaluate_holdout(model, vae, diffusion, noise_scheduler, held_out_vocab,
+                      qwen_model, qwen_processor, qwen_prompt,
+                      args, tokenizer, text_encoder, out_dir, tag, eval_sample_count):
+    model.eval()
+    sample_words = held_out_vocab[:eval_sample_count]
+    n = len(sample_words)
+    labels = torch.arange(n).long().to(args.device) % max(n, 1)
+
+    images = diffusion.sampling(
+        model, vae, n=n, x_text=sample_words, labels=labels, args=args,
+        style_extractor=None, noise_scheduler=noise_scheduler,
+        transform=None, character_classes=None, tokenizer=tokenizer, text_encoder=text_encoder
+    )
+    result = run_qwen_eval(images, sample_words, qwen_model, qwen_processor, qwen_prompt, args, out_dir, tag)
+    model.train()
+    return result
+
+
+def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
+                      train_data, pool_indices, held_out_vocab, held_out_indices,
+                      noise_scheduler, args, tokenizer, text_encoder, scaler, results_log,
+                      qwen_model, qwen_processor, qwen_prompt):
+    model.train()
+    rng = random.Random(args.seed)
+    loader = None
+    current_subset_words = None
+
+    for epoch in range(args.epochs):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+        # --- rotate subset every N epochs ---
+        if epoch % args.rotate_every == 0:
+            subset_indices = sample_training_subset(pool_indices, args.subset_size, rng)
+            loader = DataLoader(
+                Subset(train_data, subset_indices),
+                batch_size=args.batch_size, shuffle=True,
+                num_workers=args.num_workers,
+                persistent_workers=args.num_workers > 0,
+                pin_memory=torch.cuda.is_available()
+            )
+            current_subset_words = sorted({train_data[i][1] for i in subset_indices})
+            print(f"\n[Epoch {epoch}] Rotated subset: {len(subset_indices)} images, "
+                  f"{len(current_subset_words)} unique words")
+            results_log['subset_rotations'].append({'epoch': epoch, 'n_words': len(current_subset_words)})
+
+        # aggressive curriculum, start_epoch defaults to 0
+        current_rec_weight = min(
+            args.rec_weight_start + (args.rec_weight_max - args.rec_weight_start) * (epoch / max(args.rec_curriculum_epochs, 1)),
+            args.rec_weight_max
+        )
+        print(f"Epoch {epoch} | rec_weight={current_rec_weight:.4f} | control={args.control}")
+
+        pbar = tqdm(loader)
+        for i, data in enumerate(pbar):
+            images = data[0].to(args.device, non_blocking=True)
+            transcr = data[1]
+            s_id = torch.tensor([int(w) for w in data[3]]).to(args.device)
+
+            text_features = tokenizer(transcr, padding="max_length", truncation=True, return_tensors="pt", max_length=200)
+            text_features = {k: v.to(args.device) for k, v in text_features.items()}
+
+            with autocast(enabled=args.amp):
+                if args.latent:
+                    with autocast(enabled=False):
+                        images_latent = vae.module.encode(images.float()).latent_dist.sample() * 0.18215
+                else:
+                    images_latent = images
+
+                noise = torch.randn_like(images_latent)
+                timesteps = diffusion.sample_timesteps(images_latent.size(0)).to(args.device)
+                noisy_images = noise_scheduler.add_noise(images_latent, noise, timesteps)
+
+                drop_labels = np.random.random() < 0.1
+                labels = None if drop_labels else s_id
+                y = labels if labels is not None else torch.zeros(images_latent.size(0), dtype=torch.long, device=args.device)
+
+                predicted_noise = model(noisy_images, timesteps, text_features, y, style_extractor=None)
+                loss = mse_loss(noise, predicted_noise)
+                mse_val = loss.item()
+
+                rec_loss_val = None
+                if epoch >= args.rec_start_epoch:
+                    noise_scheduler.set_timesteps(15)
+                    timesteps_list = list(noise_scheduler.timesteps)
+                    x_approx = noisy_images.clone()
+
+                    with torch.no_grad():
+                        for step in timesteps_list[:-1]:
+                            t_approx = (torch.ones(x_approx.size(0), device=args.device) * step).long()
+                            pred_noise_approx = model(x_approx, t_approx, text_features, s_id, style_extractor=None)
+                            x_approx = noise_scheduler.step(pred_noise_approx.float(), step, x_approx.float()).prev_sample
+
+                    final_step = timesteps_list[-1]
+                    t_final = (torch.ones(x_approx.size(0), device=args.device) * final_step).long()
+                    pred_noise_final = model(x_approx, t_final, text_features, s_id, style_extractor=None)
+                    x_approx = noise_scheduler.step(pred_noise_final.float(), final_step, x_approx.float()).prev_sample
+
+                    # --- THE VARIABLE UNDER TEST ---
+                    # control=True reproduces the OLD bug (detach -> no gradient
+                    # to UNet) as a same-subset, same-curriculum baseline.
+                    # control=False (default) is the fix: no detach.
+                    if args.control:
+                        x_approx = x_approx.detach()
+
+                    if args.latent:
+                        with autocast(enabled=False):
+                            image_approx = vae.module.decode((x_approx / 0.18215).float()).sample
+                        image_approx = (image_approx / 2 + 0.5).clamp(0, 1)
+                    else:
+                        image_approx = ((x_approx.clamp(-1, 1) + 1) / 2)
+
+                    pixel_values = preprocess_image_for_recognizer_torch(image_approx, args)
+                    gt_labels = pad_sequence(
+                        [torch.tensor([_train_mod.recognizer_tokenizer.bos_token_id] +
+                                       _train_mod.recognizer_tokenizer(tr).input_ids +
+                                       [_train_mod.recognizer_tokenizer.eos_token_id]) for tr in transcr],
+                        batch_first=True, padding_value=-100
+                    ).to(args.device)
+
+                    with autocast(enabled=False):
+                        outputs_emb = _train_mod.recognizer_conv(pixel_values.float())
+                        outputs = _train_mod.recognizer_transformer(inputs_embeds=outputs_emb, labels=gt_labels)
+                    rec_loss = torch.clamp(outputs.loss, max=5.0)
+                    rec_loss_val = rec_loss.item()
+                    loss = loss + current_rec_weight * rec_loss
+
+            optimizer.zero_grad()
+            if args.amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            ema.step_ema(ema_model, model)
+
+            if i % args.log_every == 0:
+                msg = f"  [E{epoch} I{i}] MSE: {mse_val:.6f}"
+                if rec_loss_val is not None:
+                    msg += f" | Rec (raw): {rec_loss_val:.6f} | Weighted: {current_rec_weight * rec_loss_val:.6f}"
+                print(msg)
+                results_log['step_log'].append({
+                    'epoch': epoch, 'step': i, 'mse': mse_val, 'rec_loss': rec_loss_val,
+                    'rec_weight': current_rec_weight
+                })
+
+        if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
+            tag = f"epoch{epoch}_{'control' if args.control else 'fixed'}"
+            result = evaluate_holdout(
+                ema_model, vae, diffusion, noise_scheduler, held_out_vocab,
+                qwen_model, qwen_processor, qwen_prompt,
+                args, tokenizer, text_encoder, os.path.join(args.save_path, 'eval'), tag,
+                args.eval_sample_count
+            )
+            results_log['eval'].append({'epoch': epoch, 'tag': tag, 'result': result})
+            with open(os.path.join(args.save_path, 'results_log.json'), 'w', encoding='utf-8') as f:
+                json.dump(results_log, f, ensure_ascii=False, indent=2)
+
+    return results_log
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    # dataset / paths -- reuse same defaults as main training script
+    parser.add_argument('--train_image_folder', type=str, default=r'./Urdu_Word_Dataset/train/processed_images')
+    parser.add_argument('--train_gt_folder', type=str, default=r'./Urdu_Word_Dataset/train/gt_txt')
+    parser.add_argument('--save_path', type=str, default='./screening_diagnostic_out')
+    parser.add_argument('--recognizer_conv_path', type=str, default='/content/DiffusionRec_Research/weights/conv_transformer_weights/icdar/conv.pt')
+    parser.add_argument('--recognizer_transformer_path', type=str, default='/content/DiffusionRec_Research/weights/conv_transformer_weights/icdar')
+    parser.add_argument('--recognizer_vocab_path', type=str, default='/content/DiffusionRec_Research/data/vocab/ved/')
+    parser.add_argument('--stable_dif_path', type=str, default='stable-diffusion-v1-5/stable-diffusion-v1-5')
+    parser.add_argument('--init_checkpoint', type=str, default=None,
+                         help='Path to a checkpoint to initialize model weights from (model_state_dict only). '
+                              'Leave unset to train from scratch.')
+
+    # diagnostic-specific
+    parser.add_argument('--subset_size', type=int, default=1000)
+    parser.add_argument('--rotate_every', type=int, default=4, help='Resample training subset every N epochs')
+    parser.add_argument('--held_out_words', type=int, default=50, help='Words entirely excluded from training pool')
+    parser.add_argument('--eval_sample_count', type=int, default=50,
+                         help='How many held-out words to sample per eval. Defaults to using the full '
+                              'held-out set (matches --held_out_words) so accuracy numbers aren\'t noisy '
+                              'from too small a sample.')
+    parser.add_argument('--qwen_checkpoint', type=str, default=None,
+                         help='Path to fine-tuned Qwen3-VL weights (local dir or HF hub id). '
+                              'If unset, eval images/manifests are still saved but not scored.')
+    parser.add_argument('--qwen_device', type=str, default='auto', help='device_map passed to Qwen3-VL')
+    parser.add_argument('--qwen_prompt_variant', type=str, default='plain',
+                         choices=list(qwen_eval.PROMPT_VARIANTS.keys()))
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--eval_every', type=int, default=4)
+    parser.add_argument('--log_every', type=int, default=20)
+    parser.add_argument('--control', type=str2bool, default=False,
+                         help='If True, detach before rec loss (reproduces the OLD bug) as a control run.')
+    parser.add_argument('--seed', type=int, default=42)
+
+    # aggressive curriculum defaults -- diagnostic only, not a real recipe
+    parser.add_argument('--rec_start_epoch', type=int, default=0)
+    parser.add_argument('--rec_weight_start', type=float, default=0.01)
+    parser.add_argument('--rec_weight_max', type=float, default=0.15)
+    parser.add_argument('--rec_curriculum_epochs', type=int, default=5)
+
+    # standard training args
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=2)
+    parser.add_argument('--img_size', type=tuple, default=(64, 256))
+    parser.add_argument('--channels', type=int, default=4)
+    parser.add_argument('--emb_dim', type=int, default=320)
+    parser.add_argument('--num_heads', type=int, default=4)
+    parser.add_argument('--num_res_blocks', type=int, default=1)
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--color', type=str2bool, default=True)
+    parser.add_argument('--latent', type=str2bool, default=True)
+    parser.add_argument('--amp', type=str2bool, default=True)
+    parser.add_argument('--sampling_steps', type=int, default=18)
+    args = parser.parse_args()
+
+    setup_logging(args)
+    load_urdu_recognizer(device=args.device, conv_path=args.recognizer_conv_path,
+                          transformer_path=args.recognizer_transformer_path,
+                          vocab_path=args.recognizer_vocab_path)
+
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+    train_data = WordGenerationDataset(args.train_image_folder, args.train_gt_folder, 'train',
+                                        fixed_size=(64, 256), transforms=transform, args=args)
+    print('Full train pool:', len(train_data))
+
+    style_classes = train_data.wclasses
+    character_classes = train_data.character_classes
+    vocab_size = len(character_classes) + _train_mod.num_tokens
+
+    # --- word index, held-out split, training pool ---
+    cache_path = os.path.join(args.save_path, 'word_index_cache.json')
+    os.makedirs(args.save_path, exist_ok=True)
+    word_index = build_word_index(train_data, cache_path)
+    pool_indices, held_out_vocab, held_out_indices = split_pool_and_holdout(
+        word_index, args.held_out_words, args.seed
+    )
+
+    tokenizer = CanineTokenizer.from_pretrained("google/canine-c")
+    text_encoder = CanineModel.from_pretrained("google/canine-c")
+    device_id = int(''.join(filter(str.isdigit, args.device)) or 0)
+    text_encoder = nn.DataParallel(text_encoder, device_ids=[device_id]).to(args.device)
+
+    unet = UNetModel(image_size=args.img_size, in_channels=args.channels, model_channels=args.emb_dim,
+                      out_channels=args.channels, num_res_blocks=args.num_res_blocks,
+                      attention_resolutions=(1, 1), channel_mult=(1, 1), num_heads=args.num_heads,
+                      num_classes=style_classes, context_dim=args.emb_dim, vocab_size=vocab_size,
+                      text_encoder=text_encoder, args=args)
+    unet = DataParallel(unet, device_ids=[device_id]).to(args.device)
+
+    if args.init_checkpoint:
+        print(f"Loading init weights from {args.init_checkpoint}")
+        ckpt = torch.load(args.init_checkpoint, map_location=args.device)
+        state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+        unet.load_state_dict(state_dict)
+
+    optimizer = optim.AdamW(unet.parameters(), lr=0.0001)
+    mse_loss = nn.MSELoss()
+    diffusion = Diffusion(img_size=args.img_size, args=args)
+    ema = EMA(0.995)
+    ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
+    scaler = GradScaler(enabled=args.amp)
+
+    vae = AutoencoderKL.from_pretrained(args.stable_dif_path, subfolder="vae")
+    vae = DataParallel(vae, device_ids=[device_id]).to(args.device)
+    vae.requires_grad_(False)
+
+    ddim = DPMSolverMultistepScheduler.from_pretrained(args.stable_dif_path, subfolder="scheduler")
+    ddim.config.algorithm_type = "dpmsolver++"
+
+    # Qwen3-VL is a 4B model -- load it once here, not per-eval-call.
+    qwen_model, qwen_processor, qwen_prompt = None, None, None
+    if args.qwen_checkpoint:
+        print(f"\nLoading Qwen OCR eval model from {args.qwen_checkpoint} (this can take a bit)...")
+        qwen_model, qwen_processor = qwen_eval.load_model(args.qwen_checkpoint, device=args.qwen_device)
+        qwen_prompt = qwen_eval.PROMPT_VARIANTS[args.qwen_prompt_variant]
+    else:
+        print("\n[WARN] --qwen_checkpoint not set -- eval images/manifests will be saved but not "
+              "scored. Pass --qwen_checkpoint to get quantitative Rec.Acc./CER numbers.")
+
+    results_log = {
+        'args': vars(args),
+        'held_out_vocab': held_out_vocab,
+        'subset_rotations': [],
+        'step_log': [],
+        'eval': [],
+    }
+
+    # baseline eval BEFORE any diagnostic training, on the same held-out words
+    print("\n=== Baseline eval (before diagnostic training) ===")
+    baseline_result = evaluate_holdout(
+        ema_model, vae, diffusion, ddim, held_out_vocab,
+        qwen_model, qwen_processor, qwen_prompt,
+        args, tokenizer, text_encoder, os.path.join(args.save_path, 'eval'), 'baseline',
+        args.eval_sample_count
+    )
+    results_log['eval'].append({'epoch': -1, 'tag': 'baseline', 'result': baseline_result})
+
+    print("\n=== Diagnostic training ===")
+    results_log = diagnostic_train(
+        diffusion, unet, ema, ema_model, vae, optimizer, mse_loss,
+        train_data, pool_indices, held_out_vocab, held_out_indices,
+        ddim, args, tokenizer, text_encoder, scaler, results_log,
+        qwen_model, qwen_processor, qwen_prompt
+    )
+
+    final_path = os.path.join(args.save_path, 'results_log.json')
+    with open(final_path, 'w', encoding='utf-8') as f:
+        json.dump(results_log, f, ensure_ascii=False, indent=2)
+    print(f"\nDone. Full log saved to {final_path}")
+    print("Compare 'baseline' eval to the final 'eval' entry to see whether "
+          "recognition accuracy moved on held-out (never-trained-on) words.")
+
+
+if __name__ == "__main__":
+    main()
