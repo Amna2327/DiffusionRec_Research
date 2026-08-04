@@ -9,3 +9,5 @@ testing/
 unsloth_env/
 outputs/
 test1_outputs.zip
+test1_full_table.csv
+eyeballing_results.py
