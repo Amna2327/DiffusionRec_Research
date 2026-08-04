@@ -369,8 +369,13 @@ def main():
     parser.add_argument('--recognizer_vocab_path', type=str, default='/content/DiffusionRec_Research/data/vocab/ved/')
     parser.add_argument('--stable_dif_path', type=str, default='stable-diffusion-v1-5/stable-diffusion-v1-5')
     parser.add_argument('--init_checkpoint', type=str, default=None,
-                         help='Path to a checkpoint to initialize model weights from (model_state_dict only). '
-                              'Leave unset to train from scratch.')
+                         help='Path to a previous checkpoint (e.g. ckpt.pt) to fine-tune on top of. '
+                              'Leave unset to train from a random init.')
+    parser.add_argument('--init_ema_checkpoint', type=str, default=None,
+                         help='Optional path to a previous EMA checkpoint (e.g. ema_ckpt.pt) to '
+                              'initialize ema_model from directly. If unset, ema_model just starts '
+                              'as a copy of the fine-tuned unet -- fine for a short diagnostic, but '
+                              'the real EMA weights are a more honest "before" state if you have them.')
 
     # diagnostic-specific
     parser.add_argument('--subset_size', type=int, default=1000)
@@ -414,6 +419,22 @@ def main():
     parser.add_argument('--sampling_steps', type=int, default=18)
     args = parser.parse_args()
 
+    # ---------------------------------------------------------------------
+    # Seed EVERYTHING before any model is constructed or any randomness is
+    # drawn. This is what makes --control True vs --control False (run
+    # separately, same --seed) an actually-isolated comparison: without
+    # this, the UNet's random weight init, the per-step noise draws
+    # (torch.randn_like), timestep sampling, and label-dropout would all
+    # differ between the two runs on top of the one line under test.
+    # Subset rotation was already seeded via random.Random(args.seed)
+    # inside diagnostic_train -- this covers everything else.
+    # ---------------------------------------------------------------------
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     setup_logging(args)
     load_urdu_recognizer(device=args.device, conv_path=args.recognizer_conv_path,
                           transformer_path=args.recognizer_transformer_path,
@@ -449,6 +470,11 @@ def main():
     unet = DataParallel(unet, device_ids=[device_id]).to(args.device)
 
     if args.init_checkpoint:
+        if not os.path.exists(args.init_checkpoint):
+            raise FileNotFoundError(
+                f"--init_checkpoint not found: {args.init_checkpoint}\n"
+                f"Double check the path -- e.g. .../word_level_model/models/ckpt.pt"
+            )
         print(f"Loading init weights from {args.init_checkpoint}")
         ckpt = torch.load(args.init_checkpoint, map_location=args.device)
         state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
@@ -459,6 +485,15 @@ def main():
     diffusion = Diffusion(img_size=args.img_size, args=args)
     ema = EMA(0.995)
     ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
+
+    if args.init_ema_checkpoint:
+        if not os.path.exists(args.init_ema_checkpoint):
+            raise FileNotFoundError(f"--init_ema_checkpoint not found: {args.init_ema_checkpoint}")
+        print(f"Loading EMA init weights from {args.init_ema_checkpoint}")
+        ema_ckpt = torch.load(args.init_ema_checkpoint, map_location=args.device)
+        ema_state_dict = ema_ckpt['ema_model_state_dict'] if 'ema_model_state_dict' in ema_ckpt else ema_ckpt
+        ema_model.load_state_dict(ema_state_dict)
+
     scaler = GradScaler(enabled=args.amp)
 
     vae = AutoencoderKL.from_pretrained(args.stable_dif_path, subfolder="vae")
