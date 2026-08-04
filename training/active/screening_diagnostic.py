@@ -51,6 +51,11 @@ from torch.nn import DataParallel
 
 REPO_ROOT = '/content/DiffusionRec_Research'
 
+# models/ and data/ live directly under REPO_ROOT, not under training/active or
+# inference/active -- needs to be on the path for `from models.unet import
+# UNetModel` etc. to resolve, both here and inside the imported train module.
+sys.path.append(REPO_ROOT)
+
 # --- main training script (training/active/train_word_level_with_resume_v2.py) ---
 sys.path.append(os.path.join(REPO_ROOT, 'training', 'active'))
 TRAIN_MODULE = 'train_word_level_with_resume_v2'
