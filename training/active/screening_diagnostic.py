@@ -366,7 +366,7 @@ def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
 def main():
     parser = argparse.ArgumentParser()
     # dataset / paths -- reuse same defaults as main training script
-    parser.add_argument('--train_image_folder', type=str, default=r'./Urdu_Word_Dataset/train/processed_images')
+    parser.add_argument('--train_image_folder', type=str, default=r'./Urdu_Word_Dataset/train/images')
     parser.add_argument('--train_gt_folder', type=str, default=r'./Urdu_Word_Dataset/train/gt_txt')
     parser.add_argument('--save_path', type=str, default='./screening_diagnostic_out')
     parser.add_argument('--recognizer_conv_path', type=str, default='/content/DiffusionRec_Research/weights/conv_transformer_weights/icdar/conv.pt')
