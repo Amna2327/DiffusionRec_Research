@@ -108,6 +108,23 @@ def build_word_index(dataset, cache_path):
         with open(cache_path, 'r', encoding='utf-8') as f:
             return json.load(f)
 
+    # Fast path: WordGenerationDataset already builds self.data as a plain list
+    # of (img_path, transcr, style_id, img_path) tuples in main_loader(), with
+    # NO image loading involved. Use it directly -- calling dataset[i] instead
+    # would trigger __getitem__'s full pipeline (main image + positive/negative
+    # + 5 style images, each sharpened/autocontrasted/resized/tensor-ified)
+    # just to read a string that's already sitting in a list. That's the
+    # difference between seconds and hours on a 70k-item dataset.
+    if hasattr(dataset, 'data') and len(dataset.data) == len(dataset):
+        print("Using dataset.data for word index (fast path, no image I/O)")
+        word_index = {}
+        for i, item in enumerate(dataset.data):
+            w = item[1]
+            word_index.setdefault(w, []).append(i)
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(word_index, f, ensure_ascii=False)
+        return word_index
+
     for attr in _CANDIDATE_ATTRS:
         if hasattr(dataset, attr):
             values = getattr(dataset, attr)
