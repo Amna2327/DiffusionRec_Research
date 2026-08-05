@@ -165,13 +165,18 @@ def run_qwen_eval(images, words, qwen_model, qwen_processor, qwen_prompt, args, 
     return result
 
 
-def evaluate_holdout(model, vae, diffusion, noise_scheduler, held_out_vocab,
+def evaluate_holdout(model, vae, diffusion, noise_scheduler, held_out_vocab, num_classes,
                       qwen_model, qwen_processor, qwen_prompt,
                       args, tokenizer, text_encoder, out_dir, tag, eval_sample_count):
     model.eval()
     sample_words = held_out_vocab[:eval_sample_count]
     n = len(sample_words)
-    labels = torch.arange(n).long().to(args.device) % max(n, 1)
+    # BUG FIX: must be % num_classes (matches original script's validate()),
+    # not % n -- word-level generation has num_classes=1 (a single dummy
+    # style), so label_emb is an Embedding(1, ...). % n produced indices
+    # 0..n-1, an out-of-bounds gather into a size-1 embedding table the
+    # moment n > 1 -- that's what crashed the CANINE forward pass above.
+    labels = torch.arange(n).long().to(args.device) % num_classes
 
     images = diffusion.sampling(
         model, vae, n=n, x_text=sample_words, labels=labels, args=args,
@@ -184,7 +189,7 @@ def evaluate_holdout(model, vae, diffusion, noise_scheduler, held_out_vocab,
 
 
 def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
-                      train_data, pool_indices, held_out_vocab,
+                      train_data, pool_indices, held_out_vocab, num_classes,
                       noise_scheduler, args, tokenizer, text_encoder, scaler, results_log,
                       qwen_model, qwen_processor, qwen_prompt):
     model.train()
@@ -319,7 +324,7 @@ def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
         if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
             tag = f"epoch{epoch}_{'control' if args.control else 'fixed'}"
             result = evaluate_holdout(
-                ema_model, vae, diffusion, noise_scheduler, held_out_vocab,
+                ema_model, vae, diffusion, noise_scheduler, held_out_vocab, num_classes,
                 qwen_model, qwen_processor, qwen_prompt,
                 args, tokenizer, text_encoder, os.path.join(args.save_path, 'eval'), tag,
                 args.eval_sample_count
@@ -522,7 +527,7 @@ def main():
     # baseline eval BEFORE any diagnostic training, on the same held-out words
     print("\n=== Baseline eval (before diagnostic training) ===")
     baseline_result = evaluate_holdout(
-        ema_model, vae, diffusion, ddim, held_out_vocab,
+        ema_model, vae, diffusion, ddim, held_out_vocab, style_classes,
         qwen_model, qwen_processor, qwen_prompt,
         args, tokenizer, text_encoder, os.path.join(args.save_path, 'eval'), 'baseline',
         args.eval_sample_count
@@ -532,7 +537,7 @@ def main():
     print("\n=== Diagnostic training ===")
     results_log = diagnostic_train(
         diffusion, unet, ema, ema_model, vae, optimizer, mse_loss,
-        train_data, pool_indices, held_out_vocab,
+        train_data, pool_indices, held_out_vocab, style_classes,
         ddim, args, tokenizer, text_encoder, scaler, results_log,
         qwen_model, qwen_processor, qwen_prompt
     )
