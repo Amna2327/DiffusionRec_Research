@@ -158,8 +158,19 @@ def run_qwen_eval(images, words, qwen_model, qwen_processor, qwen_prompt, args, 
               f"inspection or a later qwen_eval.py run.")
         return None
 
+    # Qwen3-VL is ~4B params -- can't sit resident on GPU during training
+    # alongside the UNet, its EMA copy, VAE, CANINE, and AdamW's optimizer
+    # state, or the first real training step OOMs (this is exactly what
+    # happened: crash landed on the first optimizer.step() after baseline
+    # eval, because baseline eval left Qwen parked on GPU for the whole
+    # training loop that followed). Bring it onto GPU only for the seconds
+    # it's actually generating, then park it back on CPU.
+    qwen_model.to(args.device)
     out_csv = os.path.join(out_dir, f"{tag}_predictions.csv")
     result = qwen_eval.evaluate(manifest_path, qwen_model, qwen_processor, qwen_prompt, out_csv)
+    qwen_model.to('cpu')
+    torch.cuda.empty_cache()
+
     print(f"  [{tag}] exact_match={result['exact_match_accuracy']*100:.2f}% "
           f"CER={result['cer']*100:.2f}% Rec.Acc.(1-CER)={result['rec_acc_1_minus_cer']*100:.2f}%")
     return result
@@ -367,7 +378,13 @@ def main():
     parser.add_argument('--qwen_checkpoint', type=str, default=None,
                          help='Path to fine-tuned Qwen3-VL weights (local dir or HF hub id). '
                               'If unset, eval images/manifests are still saved but not scored.')
-    parser.add_argument('--qwen_device', type=str, default='auto', help='device_map passed to Qwen3-VL')
+    parser.add_argument('--qwen_device', type=str, default='cpu',
+                         help='device_map passed to Qwen3-VL at load time. Defaults to cpu -- the '
+                              'script moves it onto --device only for the seconds it\'s actually '
+                              'scoring, then parks it back on CPU, since a 4B model can\'t sit '
+                              'resident on GPU during training without risking OOM. Loading directly '
+                              'onto GPU (e.g. "auto") also works but risks accelerate dispatch hooks '
+                              'that can refuse the later .to() move -- cpu avoids that entirely.')
     parser.add_argument('--qwen_prompt_variant', type=str, default='plain',
                          choices=list(qwen_eval.PROMPT_VARIANTS.keys()))
     parser.add_argument('--epochs', type=int, default=20)
