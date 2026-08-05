@@ -38,6 +38,7 @@ import json
 import random
 import argparse
 import copy
+import gc
 
 import numpy as np
 import torch
@@ -124,7 +125,7 @@ def sample_training_subset(pool_indices, subset_size, rng):
 
 
 
-def run_qwen_eval(images, words, qwen_model, qwen_processor, qwen_prompt, args, out_dir, tag):
+def run_qwen_eval(images, words, args, out_dir, tag):
     """
     Real integration with inference/active/qwen_eval.py.
 
@@ -152,23 +153,30 @@ def run_qwen_eval(images, words, qwen_model, qwen_processor, qwen_prompt, args, 
             pil_img.save(img_path)
             writer.writerow([img_path, word])
 
-    if qwen_model is None:
+    if not args.qwen_checkpoint:
         print(f"  [WARN] --qwen_checkpoint not set -- skipping quantitative score "
               f"for '{tag}'. Images + manifest saved to {img_dir} for manual "
               f"inspection or a later qwen_eval.py run.")
         return None
 
-    # Qwen3-VL is ~4B params -- can't sit resident on GPU during training
-    # alongside the UNet, its EMA copy, VAE, CANINE, and AdamW's optimizer
-    # state, or the first real training step OOMs (this is exactly what
-    # happened: crash landed on the first optimizer.step() after baseline
-    # eval, because baseline eval left Qwen parked on GPU for the whole
-    # training loop that followed). Bring it onto GPU only for the seconds
-    # it's actually generating, then park it back on CPU.
-    qwen_model.to(args.device)
+    # Load Qwen fresh for this eval pass and fully discard it afterward --
+    # NOT parked on CPU between passes. Parking a 4B-param model on CPU
+    # between evals (what the previous version did) was itself the cause of
+    # a later crash: it quietly eats several GB of system RAM (not GPU VRAM)
+    # for the epochs in between, and Colab's system RAM is much tighter than
+    # its GPU VRAM -- with persistent DataLoader workers also holding memory,
+    # the OS's OOM killer ended up killing a worker process. Loading fresh
+    # each time costs a few seconds per eval pass but leaves nothing idle
+    # in between, on GPU or CPU.
+    print(f"  Loading Qwen for eval pass '{tag}'...")
+    qwen_model, qwen_processor = qwen_eval.load_model(args.qwen_checkpoint, device=args.qwen_device)
+    qwen_prompt = qwen_eval.PROMPT_VARIANTS[args.qwen_prompt_variant]
+
     out_csv = os.path.join(out_dir, f"{tag}_predictions.csv")
     result = qwen_eval.evaluate(manifest_path, qwen_model, qwen_processor, qwen_prompt, out_csv)
-    qwen_model.to('cpu')
+
+    del qwen_model, qwen_processor
+    gc.collect()
     torch.cuda.empty_cache()
 
     print(f"  [{tag}] exact_match={result['exact_match_accuracy']*100:.2f}% "
@@ -177,7 +185,6 @@ def run_qwen_eval(images, words, qwen_model, qwen_processor, qwen_prompt, args, 
 
 
 def evaluate_holdout(model, vae, diffusion, noise_scheduler, held_out_vocab, num_classes,
-                      qwen_model, qwen_processor, qwen_prompt,
                       args, tokenizer, text_encoder, out_dir, tag, eval_sample_count):
     model.eval()
     sample_words = held_out_vocab[:eval_sample_count]
@@ -194,15 +201,14 @@ def evaluate_holdout(model, vae, diffusion, noise_scheduler, held_out_vocab, num
         style_extractor=None, noise_scheduler=noise_scheduler,
         transform=None, character_classes=None, tokenizer=tokenizer, text_encoder=text_encoder
     )
-    result = run_qwen_eval(images, sample_words, qwen_model, qwen_processor, qwen_prompt, args, out_dir, tag)
+    result = run_qwen_eval(images, sample_words, args, out_dir, tag)
     model.train()
     return result
 
 
 def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
                       train_data, pool_indices, held_out_vocab, num_classes,
-                      noise_scheduler, args, tokenizer, text_encoder, scaler, results_log,
-                      qwen_model, qwen_processor, qwen_prompt):
+                      noise_scheduler, args, tokenizer, text_encoder, scaler, results_log):
     model.train()
     rng = random.Random(args.seed)
     loader = None
@@ -336,7 +342,6 @@ def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
             tag = f"epoch{epoch}_{'control' if args.control else 'fixed'}"
             result = evaluate_holdout(
                 ema_model, vae, diffusion, noise_scheduler, held_out_vocab, num_classes,
-                qwen_model, qwen_processor, qwen_prompt,
                 args, tokenizer, text_encoder, os.path.join(args.save_path, 'eval'), tag,
                 args.eval_sample_count
             )
@@ -378,13 +383,12 @@ def main():
     parser.add_argument('--qwen_checkpoint', type=str, default=None,
                          help='Path to fine-tuned Qwen3-VL weights (local dir or HF hub id). '
                               'If unset, eval images/manifests are still saved but not scored.')
-    parser.add_argument('--qwen_device', type=str, default='cpu',
-                         help='device_map passed to Qwen3-VL at load time. Defaults to cpu -- the '
-                              'script moves it onto --device only for the seconds it\'s actually '
-                              'scoring, then parks it back on CPU, since a 4B model can\'t sit '
-                              'resident on GPU during training without risking OOM. Loading directly '
-                              'onto GPU (e.g. "auto") also works but risks accelerate dispatch hooks '
-                              'that can refuse the later .to() move -- cpu avoids that entirely.')
+    parser.add_argument('--qwen_device', type=str, default='auto',
+                         help='device_map passed to Qwen3-VL. Loaded fresh right before each eval '
+                              'pass and fully deleted afterward (not kept resident between passes, '
+                              'GPU or CPU) -- a 4B model sitting idle for epochs at a time was itself '
+                              'the cause of an earlier crash (system RAM, not GPU VRAM). "auto" is '
+                              'fine here since the model is never moved after loading, only deleted.')
     parser.add_argument('--qwen_prompt_variant', type=str, default='plain',
                          choices=list(qwen_eval.PROMPT_VARIANTS.keys()))
     parser.add_argument('--epochs', type=int, default=20)
@@ -523,13 +527,7 @@ def main():
     ddim = DPMSolverMultistepScheduler.from_pretrained(args.stable_dif_path, subfolder="scheduler")
     ddim.config.algorithm_type = "dpmsolver++"
 
-    # Qwen3-VL is a 4B model -- load it once here, not per-eval-call.
-    qwen_model, qwen_processor, qwen_prompt = None, None, None
-    if args.qwen_checkpoint:
-        print(f"\nLoading Qwen OCR eval model from {args.qwen_checkpoint} (this can take a bit)...")
-        qwen_model, qwen_processor = qwen_eval.load_model(args.qwen_checkpoint, device=args.qwen_device)
-        qwen_prompt = qwen_eval.PROMPT_VARIANTS[args.qwen_prompt_variant]
-    else:
+    if not args.qwen_checkpoint:
         print("\n[WARN] --qwen_checkpoint not set -- eval images/manifests will be saved but not "
               "scored. Pass --qwen_checkpoint to get quantitative Rec.Acc./CER numbers.")
 
@@ -545,7 +543,6 @@ def main():
     print("\n=== Baseline eval (before diagnostic training) ===")
     baseline_result = evaluate_holdout(
         ema_model, vae, diffusion, ddim, held_out_vocab, style_classes,
-        qwen_model, qwen_processor, qwen_prompt,
         args, tokenizer, text_encoder, os.path.join(args.save_path, 'eval'), 'baseline',
         args.eval_sample_count
     )
@@ -555,8 +552,7 @@ def main():
     results_log = diagnostic_train(
         diffusion, unet, ema, ema_model, vae, optimizer, mse_loss,
         train_data, pool_indices, held_out_vocab, style_classes,
-        ddim, args, tokenizer, text_encoder, scaler, results_log,
-        qwen_model, qwen_processor, qwen_prompt
+        ddim, args, tokenizer, text_encoder, scaler, results_log
     )
 
     final_path = os.path.join(args.save_path, 'results_log.json')
