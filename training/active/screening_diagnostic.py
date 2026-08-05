@@ -12,9 +12,11 @@ Design (see DiffusionRec_Recognition_Gap diagnostic doc):
   - Recognition-loss curriculum is cranked aggressively (--rec_weight_start,
     --rec_weight_max, --rec_curriculum_epochs, --rec_start_epoch=0) on
     purpose -- this is a diagnostic config, not a realistic training recipe.
-  - Held-out eval words are a set of words EXCLUDED from the training pool
-    entirely (not just a held-out split of the subset), so eval measures
-    generalization, not memorization.
+  - Held-out eval words are drawn from the disjoint val set (never touched by
+    the original full training run), not carved out of train -- carving from
+    train only excludes words from THIS diagnostic's subset rotation, but the
+    base checkpoint already saw every train word during full training, so
+    that wouldn't measure real generalization.
   - --control lets you flip back to the OLD (broken/detached) gradient path
     so you can run a same-subset, same-curriculum control and isolate
     whether it's really the fix doing the work, not just aggressive loss
@@ -92,85 +94,34 @@ def GradScaler(enabled=True):
 
 
 # ---------------------------------------------------------------------------
-# Word-index construction: maps word -> list of dataset indices, so we can
-# (a) carve out a held-out vocabulary excluded from training entirely, and
-# (b) sample rotating training subsets from the remaining pool.
-# Tries cheap attribute access first; falls back to a one-time full pass
-# (cached to disk afterward so you only pay this cost once).
+# Held-out eval vocab comes from the val set, which is genuinely disjoint from
+# train (never touched by the original full training run) -- unlike carving
+# words out of train, which the base checkpoint has already seen regardless.
+# No indexing/caching needed here: WordGenerationDataset already builds
+# self.data as a plain list of (img_path, transcr, style_id, img_path) tuples
+# with zero image I/O, so pulling unique words out of val is near-instant even
+# without the fast-path/cache machinery train indexing used to need.
 # ---------------------------------------------------------------------------
-_CANDIDATE_ATTRS = ['transcrs', 'words', 'gt_texts', 'transcriptions',
-                     'labels_text', 'wordsList', 'gt_list', 'texts']
 
-
-def build_word_index(dataset, cache_path):
-    if os.path.exists(cache_path):
-        print(f"Loading cached word index from {cache_path}")
-        with open(cache_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-
-    # Fast path: WordGenerationDataset already builds self.data as a plain list
-    # of (img_path, transcr, style_id, img_path) tuples in main_loader(), with
-    # NO image loading involved. Use it directly -- calling dataset[i] instead
-    # would trigger __getitem__'s full pipeline (main image + positive/negative
-    # + 5 style images, each sharpened/autocontrasted/resized/tensor-ified)
-    # just to read a string that's already sitting in a list. That's the
-    # difference between seconds and hours on a 70k-item dataset.
-    if hasattr(dataset, 'data') and len(dataset.data) == len(dataset):
-        print("Using dataset.data for word index (fast path, no image I/O)")
-        word_index = {}
-        for i, item in enumerate(dataset.data):
-            w = item[1]
-            word_index.setdefault(w, []).append(i)
-        with open(cache_path, 'w', encoding='utf-8') as f:
-            json.dump(word_index, f, ensure_ascii=False)
-        return word_index
-
-    for attr in _CANDIDATE_ATTRS:
-        if hasattr(dataset, attr):
-            values = getattr(dataset, attr)
-            if len(values) == len(dataset):
-                print(f"Using dataset.{attr} for word index (fast path)")
-                word_index = {}
-                for i, w in enumerate(values):
-                    word_index.setdefault(w, []).append(i)
-                with open(cache_path, 'w', encoding='utf-8') as f:
-                    json.dump(word_index, f, ensure_ascii=False)
-                return word_index
-
-    print("No word-list attribute found on dataset -- doing a one-time full "
-          f"pass over {len(dataset)} items to build the word index. This is "
-          "slow but only happens once (cached afterward).")
-    word_index = {}
-    for i in tqdm(range(len(dataset)), desc="Indexing words"):
-        w = dataset[i][1]
-        word_index.setdefault(w, []).append(i)
-    with open(cache_path, 'w', encoding='utf-8') as f:
-        json.dump(word_index, f, ensure_ascii=False)
-    return word_index
-
-
-def split_pool_and_holdout(word_index, held_out_words, seed):
+def build_val_held_out_vocab(val_data, n_words, seed):
+    words = sorted({item[1] for item in val_data.data})
     rng = random.Random(seed)
-    all_words = list(word_index.keys())
-    rng.shuffle(all_words)
-    if held_out_words > len(all_words):
-        raise ValueError(f"held_out_words ({held_out_words}) > vocab size ({len(all_words)})")
-
-    held_out_vocab = all_words[:held_out_words]
-    pool_vocab = all_words[held_out_words:]
-
-    held_out_indices = [i for w in held_out_vocab for i in word_index[w]]
-    pool_indices = [i for w in pool_vocab for i in word_index[w]]
-
-    print(f"Held-out vocab: {len(held_out_vocab)} words / {len(held_out_indices)} images "
-          f"(excluded from training entirely)")
-    print(f"Training pool: {len(pool_vocab)} words / {len(pool_indices)} images")
-    return pool_indices, held_out_vocab, held_out_indices
+    rng.shuffle(words)
+    if n_words > len(words):
+        print(f"[WARN] --held_out_words ({n_words}) > val vocab size ({len(words)}); using all {len(words)}")
+        n_words = len(words)
+    held_out_vocab = words[:n_words]
+    print(f"Held-out eval vocab: {len(held_out_vocab)} words drawn from val "
+          f"({len(words)} unique words / {len(val_data)} images in val) -- "
+          f"genuinely unseen by the checkpoint, not just excluded from this run's subset")
+    return held_out_vocab
 
 
 def sample_training_subset(pool_indices, subset_size, rng):
     size = min(subset_size, len(pool_indices))
     return rng.sample(pool_indices, size)
+
+
 
 
 def run_qwen_eval(images, words, qwen_model, qwen_processor, qwen_prompt, args, out_dir, tag):
@@ -233,7 +184,7 @@ def evaluate_holdout(model, vae, diffusion, noise_scheduler, held_out_vocab,
 
 
 def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
-                      train_data, pool_indices, held_out_vocab, held_out_indices,
+                      train_data, pool_indices, held_out_vocab,
                       noise_scheduler, args, tokenizer, text_encoder, scaler, results_log,
                       qwen_model, qwen_processor, qwen_prompt):
     model.train()
@@ -402,7 +353,8 @@ def main():
     # diagnostic-specific
     parser.add_argument('--subset_size', type=int, default=1000)
     parser.add_argument('--rotate_every', type=int, default=4, help='Resample training subset every N epochs')
-    parser.add_argument('--held_out_words', type=int, default=50, help='Words entirely excluded from training pool')
+    parser.add_argument('--held_out_words', type=int, default=50,
+                         help='How many unique words from the (disjoint) val set to use for held-out eval')
     parser.add_argument('--eval_sample_count', type=int, default=50,
                          help='How many held-out words to sample per eval. Defaults to using the full '
                               'held-out set (matches --held_out_words) so accuracy numbers aren\'t noisy '
@@ -490,17 +442,18 @@ def main():
                                         fixed_size=(64, 256), transforms=transform, args=args)
     print('Full train pool:', len(train_data))
 
+    val_data = WordGenerationDataset(args.val_image_folder, args.val_gt_folder, 'val',
+                                      fixed_size=(64, 256), transforms=transform, args=args)
+    print('Val pool (genuinely disjoint, never trained on):', len(val_data))
+
     style_classes = train_data.wclasses
     character_classes = train_data.character_classes
     vocab_size = len(character_classes) + _train_mod.num_tokens
 
-    # --- word index, held-out split, training pool ---
-    cache_path = os.path.join(args.save_path, 'word_index_cache.json')
-    os.makedirs(args.save_path, exist_ok=True)
-    word_index = build_word_index(train_data, cache_path)
-    pool_indices, held_out_vocab, held_out_indices = split_pool_and_holdout(
-        word_index, args.held_out_words, args.seed
-    )
+    # Entire train set is fair game for subset rotation -- no carve-out needed,
+    # since held-out eval now comes from the disjoint val set instead.
+    pool_indices = list(range(len(train_data)))
+    held_out_vocab = build_val_held_out_vocab(val_data, args.held_out_words, args.seed)
 
     tokenizer = CanineTokenizer.from_pretrained("google/canine-c")
     text_encoder = CanineModel.from_pretrained("google/canine-c")
@@ -579,7 +532,7 @@ def main():
     print("\n=== Diagnostic training ===")
     results_log = diagnostic_train(
         diffusion, unet, ema, ema_model, vae, optimizer, mse_loss,
-        train_data, pool_indices, held_out_vocab, held_out_indices,
+        train_data, pool_indices, held_out_vocab,
         ddim, args, tokenizer, text_encoder, scaler, results_log,
         qwen_model, qwen_processor, qwen_prompt
     )
