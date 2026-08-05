@@ -439,6 +439,29 @@ def main():
     parser.add_argument('--latent', type=str2bool, default=True)
     parser.add_argument('--amp', type=str2bool, default=True)
     parser.add_argument('--sampling_steps', type=int, default=18)
+
+    # ------------------------------------------------------------------
+    # The following aren't used directly by this diagnostic script, but
+    # UNetModel (and other components reused from the main training
+    # script) read them off the `args` namespace internally -- e.g.
+    # `self.interpolation = args.interpolation` inside models/unet.py.
+    # They need to exist on args even though this script never branches
+    # on them itself, or you'll hit AttributeError deep inside a reused
+    # class. Defaults match the original training script.
+    # ------------------------------------------------------------------
+    parser.add_argument('--model_name', type=str, default='diffusionpen')
+    parser.add_argument('--level', type=str, default='word')
+    parser.add_argument('--dataset', type=str, default='word_generation')
+    parser.add_argument('--unet', type=str, default='unet_latent')
+    parser.add_argument('--img_feat', type=str2bool, default=False)
+    parser.add_argument('--interpolation', type=str2bool, default=False)
+    parser.add_argument('--dataparallel', type=str2bool, default=False)
+    parser.add_argument('--mix_rate', type=float, default=None)
+    parser.add_argument('--train_mode', type=str, default='train')
+    parser.add_argument('--sampling_mode', type=str, default='single_sampling')
+    parser.add_argument('--sampling_word', type=str2bool, default=False)
+    parser.add_argument('--val_image_folder', type=str, default=r'./Urdu_Word_Dataset/val/images')
+    parser.add_argument('--val_gt_folder', type=str, default=r'./Urdu_Word_Dataset/val/gt_txt')
     args = parser.parse_args()
 
     # ---------------------------------------------------------------------
