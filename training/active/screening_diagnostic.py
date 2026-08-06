@@ -6,12 +6,20 @@ actually moves recognition accuracy, before committing to full 71k-word
 training runs.
 
 Design (see DiffusionRec_Recognition_Gap diagnostic doc):
-  - Train on a SMALL rotating subset of the training pool (not the full
-    71,207 words) -- subset is resampled every --rotate_every epochs so no
-    single image gets memorized via repeated exposure across the whole run.
-  - Recognition-loss curriculum is cranked aggressively (--rec_weight_start,
-    --rec_weight_max, --rec_curriculum_epochs, --rec_start_epoch=0) on
-    purpose -- this is a diagnostic config, not a realistic training recipe.
+  - Train on a SMALL subset of the training pool (not the full 71,207 words),
+    optionally rotated every --rotate_every epochs. Set --rotate_every >=
+    --epochs for a single fixed subset instead -- see that flag's help text
+    for why rotation's original rationale no longer applies now that eval
+    comes from a genuinely disjoint val set.
+  - Recognition-loss curriculum ramps faster than the paper's real recipe
+    (--rec_weight_start, --rec_weight_max, --rec_curriculum_epochs,
+    --rec_start_epoch=0), since the point is to see a fast, cheap signal --
+    but defaults are tuned to stay a regularizer alongside MSE, not a
+    dominating term. Earlier defaults (max=0.15, ramped by epoch 5) were
+    found to collapse generation quality outright in BOTH control and fixed
+    runs identically by epoch 3 -- not testing the gradient fix at all past
+    that point. Current defaults (max=0.03, ramped over 12 epochs) sit below
+    the paper's own real cap (0.05 over 150 epochs).
   - Held-out eval words are drawn from the disjoint val set (never touched by
     the original full training run), not carved out of train -- carving from
     train only excludes words from THIS diagnostic's subset rotation, but the
@@ -366,9 +374,10 @@ def main():
                          help='Path to a previous checkpoint (e.g. ckpt.pt) to fine-tune on top of. '
                               'Leave unset to train from a random init.')
     parser.add_argument('--init_ema_checkpoint', type=str, default=None,
-                     help='Optional path to a previous EMA checkpoint (e.g. ema_ckpt.pt) to '
-                          'initialize ema_model from directly. If unset, ema_model just starts '
-                          'as a copy of the fine-tuned unet.')
+                         help='Optional path to a previous EMA checkpoint (e.g. ema_ckpt.pt) to '
+                              'initialize ema_model from directly. If unset, ema_model just starts '
+                              'as a copy of the fine-tuned unet -- fine for a short diagnostic, but '
+                              'the real EMA weights are a more honest "before" state if you have them.')
     parser.add_argument('--init_optimizer_checkpoint', type=str, default=None,
                          help='Path to the ORIGINAL optim.pt from full training (e.g. '
                               'word_level_model/models/optim.pt). Without this, optimizer is '
@@ -380,10 +389,17 @@ def main():
                               'strong confound, independent of the detach/control question this '
                               'script exists to test. Strongly recommended whenever --init_checkpoint '
                               'is also set.')
-
     # diagnostic-specific
     parser.add_argument('--subset_size', type=int, default=1000)
-    parser.add_argument('--rotate_every', type=int, default=4, help='Resample training subset every N epochs')
+    parser.add_argument('--rotate_every', type=int, default=4,
+                         help='Resample training subset every N epochs. Set >= --epochs to disable '
+                              'rotation entirely (a single fixed subset for the whole run). Rotation '
+                              'was originally meant to guard against the model memorizing eval words '
+                              '-- but eval now comes from the disjoint val set, never included in any '
+                              'training subset regardless of rotation, so that original purpose no '
+                              'longer applies. Disabling rotation removes it as a second source of '
+                              'training instability on top of the recognition-loss curriculum, making '
+                              'it easier to attribute any effect to the gradient-path fix specifically.')
     parser.add_argument('--held_out_words', type=int, default=50,
                          help='How many unique words from the (disjoint) val set to use for held-out eval')
     parser.add_argument('--eval_sample_count', type=int, default=50,
@@ -410,9 +426,23 @@ def main():
 
     # aggressive curriculum defaults -- diagnostic only, not a real recipe
     parser.add_argument('--rec_start_epoch', type=int, default=0)
-    parser.add_argument('--rec_weight_start', type=float, default=0.01)
-    parser.add_argument('--rec_weight_max', type=float, default=0.15)
-    parser.add_argument('--rec_curriculum_epochs', type=int, default=5)
+    parser.add_argument('--rec_weight_start', type=float, default=0.001)
+    # DIALED BACK from 0.15: at 0.15, observed logs showed the *weighted* rec
+    # loss growing to exceed MSE by epoch 3-5 (e.g. weighted=0.40 vs MSE=0.16
+    # at epoch 5), and Qwen Rec.Acc. collapsed from a 40% baseline to -117%
+    # by epoch 3 -- the recognition term was dominating the total loss and
+    # wrecking generation quality outright, in BOTH control and fixed runs
+    # identically, which means it wasn't testing the gradient fix at all by
+    # that point. The paper's own real recipe caps at 0.05 over 150 epochs
+    # specifically because they'd already found this collapse mode. 0.03 sits
+    # below that cap -- still faster/more aggressive than the real recipe
+    # (this is still a diagnostic, not the real training config), but should
+    # stay a true regularizer rather than a competing objective.
+    parser.add_argument('--rec_weight_max', type=float, default=0.03)
+    # DIALED BACK from 5: reaching max weight by epoch 5 (out of 20) was too
+    # sharp a ramp on top of the higher max above. 12 spreads it over most
+    # of a 20-epoch run instead of the first quarter.
+    parser.add_argument('--rec_curriculum_epochs', type=int, default=12)
 
     # standard training args
     parser.add_argument('--batch_size', type=int, default=8)
