@@ -365,11 +365,17 @@ def main():
     parser.add_argument('--init_checkpoint', type=str, default=None,
                          help='Path to a previous checkpoint (e.g. ckpt.pt) to fine-tune on top of. '
                               'Leave unset to train from a random init.')
-    parser.add_argument('--init_ema_checkpoint', type=str, default=None,
-                         help='Optional path to a previous EMA checkpoint (e.g. ema_ckpt.pt) to '
-                              'initialize ema_model from directly. If unset, ema_model just starts '
-                              'as a copy of the fine-tuned unet -- fine for a short diagnostic, but '
-                              'the real EMA weights are a more honest "before" state if you have them.')
+    parser.add_argument('--init_optimizer_checkpoint', type=str, default=None,
+                         help='Path to the ORIGINAL optim.pt from full training (e.g. '
+                              'word_level_model/models/optim.pt). Without this, optimizer is '
+                              'constructed fresh with zero momentum/variance history -- this is a '
+                              'known destabilizer when fine-tuning an already-converged model: '
+                              'it per-parameter adaptive learning-rate estimates are unstable '
+                              'for their first several dozen steps with no prior history, and that '
+                              'instability hitting already-good weights on a narrow subset is a '
+                              'strong confound, independent of the detach/control question this '
+                              'script exists to test. Strongly recommended whenever --init_checkpoint '
+                              'is also set.')
 
     # diagnostic-specific
     parser.add_argument('--subset_size', type=int, default=1000)
@@ -505,6 +511,34 @@ def main():
         unet.load_state_dict(state_dict)
 
     optimizer = optim.AdamW(unet.parameters(), lr=0.0001)
+
+    if args.init_optimizer_checkpoint:
+        if not os.path.exists(args.init_optimizer_checkpoint):
+            raise FileNotFoundError(
+                f"--init_optimizer_checkpoint not found: {args.init_optimizer_checkpoint}\\n"
+                f"Double check the path -- e.g. .../word_level_model/models/optim.pt"
+            )
+        print(f"Loading optimizer state from {args.init_optimizer_checkpoint}")
+        opt_ckpt = torch.load(args.init_optimizer_checkpoint, map_location=args.device)
+        # Handle both the raw state_dict format the legacy ckpt.pt/optim.pt pair
+        # uses (torch.save(optimizer.state_dict(), ...) directly) and the newer
+        # comprehensive-checkpoint format (a dict with an 'optimizer_state_dict'
+        # key), same dual-handling pattern already used above for
+        # --init_checkpoint / model_state_dict.
+        opt_state = opt_ckpt['optimizer_state_dict'] if isinstance(opt_ckpt, dict) and 'optimizer_state_dict' in opt_ckpt else opt_ckpt
+        try:
+            optimizer.load_state_dict(opt_state)
+            print("Optimizer state restored -- momentum/variance history carried over, "
+                  "no fresh-Adam-destabilization confound.")
+        except Exception as e:
+            print(f"[WARN] Failed to load optimizer state: {e}")
+            print("Continuing with a freshly-initialized optimizer -- note this reintroduces "
+                  "the fresh-Adam confound flagged above.")
+    else:
+        print("[WARN] --init_optimizer_checkpoint not set -- optimizer starts fresh (no momentum/"
+              "variance history). If --init_checkpoint is set, this is a real destabilization risk, "
+              "independent of the control/fixed question this script tests.")
+
     mse_loss = nn.MSELoss()
     diffusion = Diffusion(img_size=args.img_size, args=args)
     ema = EMA(0.995)
