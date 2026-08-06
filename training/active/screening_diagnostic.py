@@ -20,6 +20,19 @@ Design (see DiffusionRec_Recognition_Gap diagnostic doc):
     runs identically by epoch 3 -- not testing the gradient fix at all past
     that point. Current defaults (max=0.03, ramped over 12 epochs) sit below
     the paper's own real cap (0.05 over 150 epochs).
+  - The rec-loss block also only runs every --rec_loss_every steps (default
+    10), not every step. The original recipe gates this at every 50 steps;
+    this diagnostic's runs are much shorter (125 steps/epoch) so every-10
+    gives roughly 12 rec-loss evaluations per epoch -- still far more
+    sampled than the real recipe's every-50, but not literally every step.
+    An earlier version of this script dropped the gate entirely (rec loss
+    ran on i==0 of every step, from epoch 0 onward -- ~50x more often than
+    the recipe this diagnostic is meant to be a faithful, if compressed,
+    version of). That's a frequency change, not just a magnitude change,
+    and on its own is a plausible destabilizer independent of whether the
+    gradient-path fix does anything -- so it needs to be gated the same way
+    the real recipe gates it, just at a tighter interval to fit the shorter
+    diagnostic run.
   - Held-out eval words are drawn from the disjoint val set (never touched by
     the original full training run), not carved out of train -- carving from
     train only excludes words from THIS diagnostic's subset rotation, but the
@@ -246,7 +259,8 @@ def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
             args.rec_weight_start + (args.rec_weight_max - args.rec_weight_start) * (epoch / max(args.rec_curriculum_epochs, 1)),
             args.rec_weight_max
         )
-        print(f"Epoch {epoch} | rec_weight={current_rec_weight:.4f} | control={args.control}")
+        print(f"Epoch {epoch} | rec_weight={current_rec_weight:.4f} | control={args.control} "
+              f"| rec_loss_every={args.rec_loss_every}")
 
         pbar = tqdm(loader)
         for i, data in enumerate(pbar):
@@ -277,7 +291,13 @@ def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
                 mse_val = loss.item()
 
                 rec_loss_val = None
-                if epoch >= args.rec_start_epoch:
+                # FIX 1: step-frequency gate re-added. The original recipe only
+                # runs this expensive 15-step recognition block on 1 in 50
+                # training steps (`i % 50 == 0`). This diagnostic's runs are
+                # much shorter (125 steps/epoch), so every-10 (~12 rec-loss
+                # evaluations/epoch) keeps it far more frequent than the real
+                # recipe while no longer running on literally every step.
+                if i % args.rec_loss_every == 0 and epoch >= args.rec_start_epoch:
                     noise_scheduler.set_timesteps(15)
                     timesteps_list = list(noise_scheduler.timesteps)
                     x_approx = noisy_images.clone()
@@ -393,13 +413,27 @@ def main():
     parser.add_argument('--subset_size', type=int, default=1000)
     parser.add_argument('--rotate_every', type=int, default=4,
                          help='Resample training subset every N epochs. Set >= --epochs to disable '
-                              'rotation entirely (a single fixed subset for the whole run). Rotation '
-                              'was originally meant to guard against the model memorizing eval words '
-                              '-- but eval now comes from the disjoint val set, never included in any '
-                              'training subset regardless of rotation, so that original purpose no '
-                              'longer applies. Disabling rotation removes it as a second source of '
-                              'training instability on top of the recognition-loss curriculum, making '
-                              'it easier to attribute any effect to the gradient-path fix specifically.')
+                              'rotation entirely (a single fixed subset for the whole run). '
+                              'IMPORTANT: leave this at the default (or otherwise < --epochs) to keep '
+                              'rotation ON. A fixed, never-rotated subset combined with '
+                              '--init_optimizer_checkpoint (which restores Adam momentum/variance '
+                              'tuned against the full 71k-image distribution) is a textbook overfitting '
+                              'setup on the narrow, unchanging subset -- and it would degrade held-out '
+                              'val accuracy on its own, with zero relation to the recognition-loss '
+                              'gradient path this script exists to test. Rotation was originally meant '
+                              'to guard against the model memorizing eval words, but eval now comes '
+                              'from the disjoint val set, never included in any training subset '
+                              'regardless of rotation -- so that original purpose no longer applies, '
+                              'but keeping rotation on still matters for training-distribution variety.')
+    parser.add_argument('--rec_loss_every', type=int, default=10,
+                         help='Run the (expensive, 15-step) recognition-loss block only every N '
+                              'training steps, gated the same way the real recipe gates it '
+                              '(`i %% 50 == 0`) but tighter to fit this diagnostic\'s much shorter '
+                              'runs (125 steps/epoch). Running it on every step is not just a bigger '
+                              'rec-loss weight, it is a fundamentally different training regime '
+                              '(roughly 50x more often than the real recipe) and is a destabilizer on '
+                              'its own -- independent of gradient flow. Set to 1 to disable gating and '
+                              'run on every step (not recommended).')
     parser.add_argument('--held_out_words', type=int, default=50,
                          help='How many unique words from the (disjoint) val set to use for held-out eval')
     parser.add_argument('--eval_sample_count', type=int, default=50,
