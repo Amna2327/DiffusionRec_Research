@@ -365,6 +365,10 @@ def main():
     parser.add_argument('--init_checkpoint', type=str, default=None,
                          help='Path to a previous checkpoint (e.g. ckpt.pt) to fine-tune on top of. '
                               'Leave unset to train from a random init.')
+    parser.add_argument('--init_ema_checkpoint', type=str, default=None,
+                     help='Optional path to a previous EMA checkpoint (e.g. ema_ckpt.pt) to '
+                          'initialize ema_model from directly. If unset, ema_model just starts '
+                          'as a copy of the fine-tuned unet.')
     parser.add_argument('--init_optimizer_checkpoint', type=str, default=None,
                          help='Path to the ORIGINAL optim.pt from full training (e.g. '
                               'word_level_model/models/optim.pt). Without this, optimizer is '
