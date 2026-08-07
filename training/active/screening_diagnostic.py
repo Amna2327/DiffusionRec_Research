@@ -457,6 +457,19 @@ def main():
     parser.add_argument('--control', type=str2bool, default=False,
                          help='If True, detach before rec loss (reproduces the OLD bug) as a control run.')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--lr', type=float, default=0.0001,
+                         help='Learning rate for AdamW. The main training script uses 1e-4 for '
+                              'training from scratch/full-scale training -- but this diagnostic is '
+                              'effectively fine-tuning an already-converged checkpoint on a narrow, '
+                              'repeated ~1000-image subset for a short run. Full-scale LR combined '
+                              'with restored Adam momentum (--init_optimizer_checkpoint) and heavy '
+                              'subset repetition is a plausible source of the large, unstable-looking '
+                              'per-eval swings observed in Rec.Acc. (e.g. 40%% -> -60%% -> -9%% -> '
+                              '-54%% over epochs 0/3/7/11) even though MSE trends down smoothly the '
+                              'whole time -- classic large-update instability on a converged model, '
+                              'not a sign the underlying approach is broken. Try something like 1e-5 '
+                              'or 2e-5 alongside more --epochs to trade speed for a smoother, more '
+                              'interpretable convergence curve.')
 
     # aggressive curriculum defaults -- diagnostic only, not a real recipe
     parser.add_argument('--rec_start_epoch', type=int, default=0)
@@ -578,7 +591,8 @@ def main():
         state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
         unet.load_state_dict(state_dict)
 
-    optimizer = optim.AdamW(unet.parameters(), lr=0.0001)
+    optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
+    print(f"Optimizer LR: {args.lr}")
 
     if args.init_optimizer_checkpoint:
         if not os.path.exists(args.init_optimizer_checkpoint):
