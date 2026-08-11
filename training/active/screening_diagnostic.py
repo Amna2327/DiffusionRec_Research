@@ -115,6 +115,34 @@ def GradScaler(enabled=True):
     return _GradScaler('cuda', enabled=enabled)
 
 
+def maybe_save_best(result, epoch, tag, model, ema_model, optimizer, args, results_log):
+    """
+    Tracks the best held-out Rec.Acc. (1-CER) seen so far across the whole run
+    -- including the pre-training baseline, so 'best' has a true reference
+    point rather than only ever comparing epochs against each other -- and
+    overwrites a single best_checkpoint.pt whenever a new best is found.
+    Saved alongside the eval outputs (args.save_path/eval/), so you don't
+    have to re-derive which epoch was best from results_log.json later.
+    """
+    if result is None:
+        return  # --qwen_checkpoint not set, nothing to compare against
+    metric = result['rec_acc_1_minus_cer']
+    if metric > results_log['best']['rec_acc']:
+        results_log['best'] = {'epoch': epoch, 'tag': tag, 'rec_acc': metric}
+        ckpt = {
+            'epoch': epoch,
+            'tag': tag,
+            'rec_acc_1_minus_cer': metric,
+            'model_state_dict': model.state_dict(),
+            'ema_model_state_dict': ema_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }
+        out_path = os.path.join(args.save_path, 'eval', 'best_checkpoint.pt')
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        torch.save(ckpt, out_path)
+        print(f"  [best] New best Rec.Acc={metric*100:.2f}% at '{tag}' -- saved to {out_path}")
+
+
 # ---------------------------------------------------------------------------
 # Held-out eval vocab comes from the val set, which is genuinely disjoint from
 # train (never touched by the original full training run) -- unlike carving
@@ -374,6 +402,7 @@ def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
                 args.eval_sample_count
             )
             results_log['eval'].append({'epoch': epoch, 'tag': tag, 'result': result})
+            maybe_save_best(result, epoch, tag, model, ema_model, optimizer, args, results_log)
             with open(os.path.join(args.save_path, 'results_log.json'), 'w', encoding='utf-8') as f:
                 json.dump(results_log, f, ensure_ascii=False, indent=2)
 
@@ -660,6 +689,7 @@ def main():
         'subset_rotations': [],
         'step_log': [],
         'eval': [],
+        'best': {'epoch': None, 'tag': None, 'rec_acc': float('-inf')},
     }
 
     # baseline eval BEFORE any diagnostic training, on the same held-out words
@@ -670,6 +700,7 @@ def main():
         args.eval_sample_count
     )
     results_log['eval'].append({'epoch': -1, 'tag': 'baseline', 'result': baseline_result})
+    maybe_save_best(baseline_result, -1, 'baseline', unet, ema_model, optimizer, args, results_log)
 
     print("\n=== Diagnostic training ===")
     results_log = diagnostic_train(
