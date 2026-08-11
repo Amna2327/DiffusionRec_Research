@@ -354,7 +354,7 @@ def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-            ema.step_ema(ema_model, model)
+            ema.step_ema(ema_model, model, step_start_ema=args.ema_step_start_ema)
 
             if i % args.log_every == 0:
                 msg = f"  [E{epoch} I{i}] MSE: {mse_val:.6f}"
@@ -457,6 +457,13 @@ def main():
     parser.add_argument('--control', type=str2bool, default=False,
                          help='If True, detach before rec loss (reproduces the OLD bug) as a control run.')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--ema_step_start_ema', type=int, default=200,
+                     help='EMA class defaults to 2000, tuned for long full-scale runs. This '
+                          'diagnostic only has ~125 steps/epoch, so with that default, ema_model '
+                          'is just a raw copy of the actively-training model (no real averaging) '
+                          'for the first ~16 epochs -- early evals reflect a noisy mid-training '
+                          'snapshot, not a smoothed checkpoint. 200 steps (~1.6 epochs) starts '
+                          'real averaging much sooner.')
     parser.add_argument('--lr', type=float, default=0.0001,
                          help='Learning rate for AdamW. The main training script uses 1e-4 for '
                               'training from scratch/full-scale training -- but this diagnostic is '
