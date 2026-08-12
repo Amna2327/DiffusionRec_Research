@@ -370,12 +370,14 @@ def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
                     rec_loss_val = rec_loss.item()
 
                     if i == 0 and epoch == 0:
-                        probe_param = next(p for p in model.module.parameters() if p.requires_grad)
-                        g = torch.autograd.grad(rec_loss, probe_param, retain_graph=True, allow_unused=True)[0]
-                        if g is None:
+                        probe_param = next(p for p in model.module.output_blocks.parameters() if p.requires_grad)
+                        optimizer.zero_grad()
+                        (current_rec_weight * rec_loss).backward(retain_graph=False)
+                        if probe_param.grad is None:
                             print("  [PROBE] rec_loss DISCONNECTED from UNet — grad is None")
                         else:
-                            print(f"  [PROBE] rec_loss connected — grad norm: {g.norm().item():.6e}")
+                            print(f"  [PROBE] rec_loss connected — grad norm: {probe_param.grad.norm().item():.6e}")
+                        import sys; sys.exit(0)
 
                     loss = loss + current_rec_weight * rec_loss
 
