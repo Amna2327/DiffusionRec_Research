@@ -368,22 +368,6 @@ def diagnostic_train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss,
                         outputs = _train_mod.recognizer_transformer(inputs_embeds=outputs_emb, labels=gt_labels)
                     rec_loss = torch.clamp(outputs.loss, max=5.0)
                     rec_loss_val = rec_loss.item()
-
-                    if i == 0 and epoch == 0:
-                        print(f"  [PROBE] rec_loss.requires_grad={rec_loss.requires_grad}, "
-                              f"grad_fn={rec_loss.grad_fn}")
-                        if rec_loss.requires_grad:
-                            probe_param = next(p for p in model.module.output_blocks.parameters() if p.requires_grad)
-                            optimizer.zero_grad()
-                            scaler.scale(rec_loss).backward(retain_graph=False)
-                            scaler.unscale_(optimizer)
-                            if probe_param.grad is None:
-                                print("  [PROBE] backward ran but grad is None (unused param)")
-                            else:
-                                print(f"  [PROBE] grad norm (unscaled, unweighted rec_loss): "
-                                      f"{probe_param.grad.norm().item():.6e}, dtype={probe_param.grad.dtype}")
-                        import sys; sys.exit(0)
-
                     loss = loss + current_rec_weight * rec_loss
 
             optimizer.zero_grad()
