@@ -1,4 +1,14 @@
 import os
+import sys
+REPO_ROOT = '/home/tahir/amna_DiffusionRec_Research/DiffusionRec_Research'
+
+# models/ and data/ live directly under REPO_ROOT, not under training/active or
+# inference/active -- needs to be on the path for `from models.unet import
+# UNetModel` etc. to resolve, both here and inside the imported train module.
+sys.path.append(REPO_ROOT)
+
+# --- main training script (training/active/train_word_level_with_resume_v2.py) ---
+sys.path.append(os.path.join(REPO_ROOT, 'training', 'active'))
 import torch
 import torch.nn as nn
 import numpy as np
@@ -41,6 +51,9 @@ from transformers import RobertaTokenizerFast, GPT2Tokenizer
 from transformers import RobertaConfig, EncoderDecoderConfig, EncoderDecoderModel
 from transformers import GPT2Config, GPT2LMHeadModel
 from evaluate import load
+
+
+
 # ---------------------------------------------------------------------------
 # MIXED PRECISION: torch.cuda.amp gives real speedups on T4 (has fp16 tensor
 # cores, no meaningful bf16 tensor-core benefit like A100/L4). autocast picks
@@ -672,20 +685,20 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
             torch.cuda.empty_cache() 
 
             if val_cer < best_cer:
-              best_cer = val_cer
-            best_checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'ema_model_state_dict': ema_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'ema_step': ema.step,
-                'best_cer': best_cer,
-                 'args': vars(args),
-            }
-        torch.save(best_checkpoint, os.path.join(args.save_path, "models", "best_checkpoint.pt"))
-        torch.save(ema_model.state_dict(), os.path.join(args.save_path, "models", "best_ema_ckpt.pt"))
-        print(f"✓ New best CER {best_cer:.4f} at epoch {epoch} — saved best_checkpoint.pt")
-
+                best_cer = val_cer
+                best_checkpoint = {
+                   'epoch': epoch,
+                   'model_state_dict': model.state_dict(),
+                   'ema_model_state_dict': ema_model.state_dict(),
+                   'optimizer_state_dict': optimizer.state_dict(),
+                   'ema_step': ema.step,
+                   'best_cer': best_cer,
+                   'args': vars(args),
+                }
+                torch.save(best_checkpoint, os.path.join(args.save_path, "models", "best_checkpoint.pt"))
+                torch.save(ema_model.state_dict(), os.path.join(args.save_path, "models", "best_ema_ckpt.pt"))
+                print(f"✓ New best CER {best_cer:.4f} at epoch {epoch} — saved best_checkpoint.pt")
+  
 def validate(diffusion, model, vae, data_loader, num_classes, noise_scheduler, transforms, args, tokenizer=None, text_encoder=None):
     model.eval()
     gt_texts = []
