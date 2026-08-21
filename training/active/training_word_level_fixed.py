@@ -244,8 +244,6 @@ class Diffusion:
                 x = ((x.clamp(-1, 1) + 1) / 2 * 255).type(torch.uint8)
 
         model.train()
-        recognized_texts = recognize_urdu_batch(x, args)
-        print(f"Generated texts recognized: {recognized_texts}")
         return x
 
 # Recognizer Integration
@@ -384,7 +382,7 @@ def load_checkpoint(checkpoint_path, model, ema_model, optimizer, ema, lr_schedu
     print(f"Loading checkpoint from: {checkpoint_path}")
     print(f"{'='*60}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     model.load_state_dict(checkpoint['model_state_dict'])
     ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
@@ -576,24 +574,48 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
 
                         loss = loss + current_rec_weight * rec_loss
 
-                optimizer.zero_grad()
+                        del x_approx, image_approx, pixel_values, outputs_emb, outputs, gt_labels
+                        del pred_noise_final
+                        del rec_loss
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"⚠️ NaN/Inf loss at epoch {epoch}, step {i} — skipping batch, not updating weights")
+                    continue
+                
+                if i % 50 == 0 and epoch >= args.rec_start_epoch:
+                     torch.cuda.empty_cache()
+                     
+                optimizer.zero_grad(set_to_none=True)
                 if args.amp:
                     scaler.scale(loss).backward()
-                    # unscale before clipping so max_norm is applied to real-scale grads
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
                 else:
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
 
+                grad_is_nan = any( 
+                    p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any())
+                    for p in model.parameters()
+                )
+                if grad_is_nan:
+                   print(f"⚠️ NaN/Inf gradient at epoch {epoch}, step {i} — skipping optimizer step")
+                   optimizer.zero_grad(set_to_none=True)
+                   continue
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if args.amp:
+                   scaler.step(optimizer)
+                   scaler.update()
+                else:
+                   optimizer.step()
+                   
                 ema.step_ema(ema_model, model)
                 loss_meter.update(loss.item(), images.size(0))
                 pbar.set_postfix(MSE=loss_meter.avg)
                 if lr_scheduler:
                     lr_scheduler.step()
+                    
+                del loss, predicted_noise, noisy_images, noise, timesteps, text_features, images_latent, images, s_id
+
 
         except RuntimeError as e:
             if "DataLoader worker" in str(e):
@@ -632,12 +654,14 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
 
             ema_sampled_images = diffusion.sampling(ema_model, vae, n=n, x_text=val_transcr[:n], labels=labels, args=args, style_extractor=None, noise_scheduler=noise_scheduler, transform=transforms, character_classes=None, tokenizer=tokenizer, text_encoder=text_encoder)
             save_images(ema_sampled_images, os.path.join(args.save_path, 'images', f"{epoch}_ema.jpg"), args, texts=val_transcr[:n])
-            torch.cuda.empty_cache()
 
             if args.wandb_log:
                 words_caption = " | ".join(val_transcr[:n])
                 caption = f"Epoch {epoch} - With words: {words_caption}"
                 wandb.log({"Sampled images": wandb.Image(ema_sampled_images[0], caption=caption)})
+
+            del ema_sampled_images, val_batch, labels
+            torch.cuda.empty_cache()
 
         if epoch % 1 == 0:
             checkpoint = {
@@ -661,13 +685,12 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
             if args.amp:
                 checkpoint['scaler_state_dict'] = scaler.state_dict()
 
-            latest_checkpoint_path = os.path.join(args.save_path, "models", "latest_checkpoint.pt")
+            latest_checkpoint_path = os.path.join(
+             args.save_path, "models", "latest_checkpoint.pt"
+            )
+
             torch.save(checkpoint, latest_checkpoint_path)
             print(f"Saved checkpoint at epoch {epoch}")
-
-            torch.save(model.state_dict(), os.path.join(args.save_path, "models", "ckpt.pt"))
-            torch.save(ema_model.state_dict(), os.path.join(args.save_path, "models", "ema_ckpt.pt"))
-            torch.save(optimizer.state_dict(), os.path.join(args.save_path, "models", "optim.pt"))
 
         if epoch % args.validate_every == 0:
             print(f"\nRunning CER validation at epoch {epoch}...")
@@ -707,7 +730,7 @@ def validate(diffusion, model, vae, data_loader, num_classes, noise_scheduler, t
         for i, data in enumerate(data_loader):
             if i >= 10:
                 break
-            images = data[0].to(args.device)
+    
             transcr = data[1]
             batch_size = min(4, len(transcr))
             transcr = transcr[:batch_size]
@@ -738,6 +761,13 @@ def main():
     # become a problem again.
     # ---------------------------------------------------------------------
     parser.add_argument('--num_workers', type=int, default=2)
+    parser.add_argument('--lr', type=float, default=5e-5,
+                     help='CONTINUATION fine-tune rate, not from-scratch. The diagnostic already '
+                          'showed 1e-5 causes eventual collapse after an early peak (epoch ~3) on a '
+                          'narrow subset -- at full 71k-image scale this may hold up longer, but '
+                          'should still be treated as an upper bound, not a safe default. The '
+                          'original 1e-4 (this script\'s previous hardcoded value) is the from-scratch '
+                          'rate and is almost certainly too aggressive here.')
     parser.add_argument('--model_name', type=str, default='diffusionpen')
     parser.add_argument('--level', type=str, default='word')
     parser.add_argument('--img_size', type=tuple, default=(64, 256))
@@ -866,7 +896,7 @@ def main():
         unet = DataParallel(unet, device_ids=device_ids)
         unet = unet.to(args.device)
 
-    optimizer = optim.AdamW(unet.parameters(), lr=0.0001)
+    optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
     lr_scheduler = None
     mse_loss = nn.MSELoss()
     diffusion = Diffusion(img_size=args.img_size, args=args)
@@ -893,6 +923,11 @@ def main():
                 scaler=scaler
             )
             print(f"✓ Successfully resumed training from epoch {start_epoch}")
+
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = args.lr
+            print(f"✓ Forced optimizer learning rate to {args.lr}")
+            
         except Exception as e:
             print(f"Warning: Failed to load checkpoint: {e}")
             print("Starting training from scratch...")
@@ -909,6 +944,13 @@ def main():
             ema_model.load_state_dict(torch.load(f'{args.save_path}/models/ema_ckpt.pt', map_location=args.device))
             print('Loaded models and optimizer (legacy mode - epoch info not available)')
             start_epoch = 0
+
+            # --- ADD THIS TO OVERRIDE THE LEGACY LR ---
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = args.lr
+            print(f"✓ Forced optimizer learning rate to {args.lr}")
+            # ------------------------------------------
+            
         except Exception as e:
             print(f"Warning: Failed to load legacy checkpoint: {e}")
             print("Starting training from scratch...")
@@ -943,12 +985,19 @@ def main():
         train(diffusion, unet, ema, ema_model, vae, optimizer, mse_loss, train_loader, val_loader, style_classes, feature_extractor, vocab_size, ddim, transform, args, tokenizer=tokenizer, text_encoder=text_encoder, lr_scheduler=lr_scheduler, letter2index=letter2index, start_epoch=start_epoch, scaler=scaler)
     elif args.train_mode == 'sampling':
         print('Sampling started....')
-        unet.load_state_dict(torch.load(f'{args.save_path}/models/ckpt.pt', map_location=args.device))
-        print('unet loaded')
-        ema = EMA(0.995)
+        latest_checkpoint_path = os.path.join(
+        args.save_path, "models", "latest_checkpoint.pt"
+        )
+        checkpoint = torch.load(
+         latest_checkpoint_path,
+         map_location=args.device,
+         weights_only=False
+        )
+
+        unet.load_state_dict(checkpoint['model_state_dict'])
+
         ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
-        ema_model.load_state_dict(torch.load(f'{args.save_path}/models/ema_ckpt.pt', map_location=args.device))
-        ema_model.eval()
+        ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
 
         words = ['کون', 'سوچ', 'ملک', 'دین']
         s = 0

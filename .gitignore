@@ -11,3 +11,8 @@ outputs/
 test1_outputs.zip
 test1_full_table.csv
 eyeballing_results.py
+gpu_power_log.csv
+nohup.out
+output2.out
+watchdog.log
+watchdog_output.log

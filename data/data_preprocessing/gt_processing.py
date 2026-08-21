@@ -5,9 +5,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # folder this .py file 
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))  # up two levels, out of data/data_preprocessing/
 
 # paths
-main_gt_file = os.path.join(REPO_ROOT, "Urdu_Word_Dataset", "val", "val_gt.txt")
-output_dir = os.path.join(REPO_ROOT, "Urdu_Word_Dataset", "val", "gt_txt")
-root_images_dir = os.path.join(REPO_ROOT, "Urdu_Word_Dataset", "val", "images")
+main_gt_file = os.path.join(REPO_ROOT, "Urdu_Word_Dataset", "train", "train_gt.txt")
+output_dir = os.path.join(REPO_ROOT, "Urdu_Word_Dataset", "train", "gt_txt")
+root_images_dir = os.path.join(REPO_ROOT, "Urdu_Word_Dataset", "train", "images")
 
 os.makedirs(output_dir, exist_ok=True)
 
