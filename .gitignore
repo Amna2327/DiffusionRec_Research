@@ -16,3 +16,13 @@ nohup.out
 output2.out
 watchdog.log
 watchdog_output.log
+generated_samples
+output3.out
+recognizer_check/
+check_recognizer.py
+recognizer_check_no_beam_truncate_first_word/
+word_samples_legacy/
+output4.out
+output5.out
+word_samples_legacy_finetuned/
+inference/active/sample_four_words_legacy.py
