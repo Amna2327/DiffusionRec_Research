@@ -276,15 +276,15 @@ def load_urdu_recognizer(conv_path='./conv_transformer_weights/icdar/conv.pt', t
     recognizer_conv.requires_grad_(False)
     recognizer_transformer.requires_grad_(False)
     generation_config = GenerationConfig(
-        max_length=256,
-        early_stopping=False,
+        max_length=20,
+        early_stopping=True,
         no_repeat_ngram_size=0,
         length_penalty=1,
-        num_beams=4,
+        num_beams=1,
         temperature=1,
         bos_token_id=recognizer_tokenizer.bos_token_id,
         eos_token_id=recognizer_tokenizer.eos_token_id,
-        pad_token_id=recognizer_tokenizer.pad_token_id
+        pad_token_id=recognizer_tokenizer.pad_token_id,
     )
     print("Urdu recognizer loaded.")
 
@@ -528,7 +528,7 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
                     # detach -- that's the one path rec_loss's gradient travels
                     # back through to reach the UNet's weights.
                     # ---------------------------------------------------------
-                    if i % 50 == 0 and epoch >= args.rec_start_epoch:
+                    if i % 50 == 0 and epoch >= args.rec_start_epoch and current_rec_weight > 0:
                         print(gpu_mem(prefix=f"[E{epoch} I{i}] Before Rec"))
                         noise_scheduler.set_timesteps(15)
                         timesteps_list = list(noise_scheduler.timesteps)
@@ -582,7 +582,7 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
                     print(f"⚠️ NaN/Inf loss at epoch {epoch}, step {i} — skipping batch, not updating weights")
                     continue
                 
-                if i % 50 == 0 and epoch >= args.rec_start_epoch:
+                if i % 50 == 0 and epoch >= args.rec_start_epoch and current_rec_weight > 0:
                      torch.cuda.empty_cache()
                      
                 optimizer.zero_grad(set_to_none=True)
@@ -610,7 +610,7 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
                    
                 ema.step_ema(ema_model, model)
                 loss_meter.update(loss.item(), images.size(0))
-                pbar.set_postfix(MSE=loss_meter.avg)
+                pbar.set_postfix(MSE=loss_meter.avg,LR=optimizer.param_groups[0]['lr'])
                 if lr_scheduler:
                     lr_scheduler.step()
                     
@@ -829,6 +829,12 @@ def main():
     parser.add_argument('--validate_every', type=int, default=5)
     args = parser.parse_args()
 
+    SEED = 42
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    np.random.seed(SEED)
+    random.seed(SEED)
+
     print('torch version', torch.__version__)
     if args.wandb_log:
         wandb.init(project='WordGeneration', name=args.dataset, config=args)
@@ -860,13 +866,23 @@ def main():
     num_workers = args.num_workers if args.num_workers > 0 else 0
     use_persistent = num_workers > 0
 
+    def seed_worker(worker_id):
+       worker_seed = SEED + worker_id
+       np.random.seed(worker_seed)
+       random.seed(worker_seed)
+
+    g = torch.Generator()
+    g.manual_seed(SEED)
+
     train_loader = DataLoader(
         train_data,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=num_workers,
         persistent_workers=use_persistent,
-        pin_memory=True if torch.cuda.is_available() else False
+        pin_memory=True if torch.cuda.is_available() else False,
+        generator=g,
+        worker_init_fn=seed_worker,
     )
     val_loader = DataLoader(
         val_data,
@@ -874,7 +890,8 @@ def main():
         shuffle=False,
         num_workers=num_workers,
         persistent_workers=use_persistent,
-        pin_memory=True if torch.cuda.is_available() else False
+        pin_memory=True if torch.cuda.is_available() else False,
+        worker_init_fn=seed_worker,
     )
 
     if args.dataparallel:
@@ -898,6 +915,7 @@ def main():
 
     optimizer = optim.AdamW(unet.parameters(), lr=args.lr)
     lr_scheduler = None
+
     mse_loss = nn.MSELoss()
     diffusion = Diffusion(img_size=args.img_size, args=args)
     ema = EMA(0.995)
@@ -923,10 +941,6 @@ def main():
                 scaler=scaler
             )
             print(f"✓ Successfully resumed training from epoch {start_epoch}")
-
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = args.lr
-            print(f"✓ Forced optimizer learning rate to {args.lr}")
             
         except Exception as e:
             print(f"Warning: Failed to load checkpoint: {e}")
@@ -940,16 +954,11 @@ def main():
         # saved from vs. what's available here.
         try:
             unet.load_state_dict(torch.load(f'{args.save_path}/models/ckpt.pt', map_location=args.device))
-            optimizer.load_state_dict(torch.load(f'{args.save_path}/models/optim.pt', map_location=args.device))
+            # optimizer.load_state_dict(torch.load(f'{args.save_path}/models/optim.pt', map_location=args.device))
             ema_model.load_state_dict(torch.load(f'{args.save_path}/models/ema_ckpt.pt', map_location=args.device))
             print('Loaded models and optimizer (legacy mode - epoch info not available)')
             start_epoch = 0
-
-            # --- ADD THIS TO OVERRIDE THE LEGACY LR ---
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = args.lr
-            print(f"✓ Forced optimizer learning rate to {args.lr}")
-            # ------------------------------------------
+            ema.step = 2000 
             
         except Exception as e:
             print(f"Warning: Failed to load legacy checkpoint: {e}")
@@ -958,6 +967,21 @@ def main():
     else:
         print("Starting fresh training (no checkpoint found or resume disabled)")
         start_epoch = 0
+
+    for param_group in optimizer.param_groups:
+       param_group['lr'] = args.lr 
+
+    warmup_steps = 400
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+       optimizer,
+       lr_lambda=lambda step: min(1.0, step / warmup_steps)
+    )
+
+    if start_epoch > 0:
+       # Resuming mid-training via resume_training — already past warmup,
+       # skip the ramp: fast-forward the scheduler so it immediately reports
+       # lambda(step)=1.0, i.e. full args.lr from the very first step.
+       lr_scheduler.step(warmup_steps)
 
     if args.latent:
         print('VAE is true')
