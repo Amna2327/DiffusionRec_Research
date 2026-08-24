@@ -460,7 +460,10 @@ def gpu_mem(prefix="", device=None):
             f"Res: {reserved:.1f} MB | "
             f"Max: {max_alloc:.1f} MB")
 
-def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, val_loader, num_classes, style_extractor, vocab_size, noise_scheduler, transforms, args, tokenizer=None, text_encoder=None, lr_scheduler=None, letter2index=None, start_epoch=0, scaler=None):
+def train(diffusion, model, ema, ema_model, vae, optimizer, 
+          mse_loss, loader, val_loader, num_classes, style_extractor, vocab_size, 
+          noise_scheduler, transforms, args, tokenizer=None, text_encoder=None, lr_scheduler=None, 
+          letter2index=None, start_epoch=0, scaler=None, original_params=None):
     model.train()
     loss_meter = AvgMeter()
     print(f'Training started from epoch {start_epoch}....')
@@ -516,6 +519,20 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, va
 
                     predicted_noise = model(noisy_images, timesteps, text_features, y, style_extractor=style_features)
                     loss = mse_loss(noise, predicted_noise)
+
+                    # L2-SP anchor: pulls weights back toward the loaded checkpoint,
+                    # proportional to how far they've drifted. Cheap -- no forward
+                    # pass, just a sum over parameter tensors already in memory.
+                    if original_params is not None and args.lambda_l2sp > 0:
+                        l2sp_loss = sum(
+                            (p - p_orig).pow(2).sum()
+                            for p, p_orig in zip(model.parameters(), original_params)
+                        )
+                        loss = loss + args.lambda_l2sp * l2sp_loss
+
+                        if i % 50 == 0:
+                            print(f"  [Step {i}] L2SP: {l2sp_loss.item():.6f}, "
+                                  f"Weighted L2SP: {(args.lambda_l2sp * l2sp_loss).item():.6f}")
 
                     # ---------------------------------------------------------
                     # Rec loss -- FIXED gradient flow.
@@ -818,6 +835,17 @@ def main():
     # to what 50 DDIM steps used to give.
     # ---------------------------------------------------------------------
     parser.add_argument('--sampling_steps', type=int, default=18)
+    #---------------------------------------------------------------------
+    #New: Adding L2SP as a way to avoid catsatrophic forgetting seen in 
+    # the model tests up uptil now, the idea is taken from the paper
+    #Explicit Inductive Bias for Transfer Learning with Convolutional Network
+    # and can be used for fine tuning and transfer learning
+    #----------------------------------------------------------------------
+    parser.add_argument('--lambda_l2sp', type=float, default=0.0,
+                     help='L2-SP anchor strength: penalizes weight distance from the loaded '
+                          'checkpoint (Li, Grandvalet & Davoine 2018) to counter catastrophic '
+                          'forgetting during fine-tuning. 0.0 disables it. Needs calibration '
+                          '(try 1e-5, 1e-4) via short runs before committing to a full run.')
     # ---------------------------------------------------------------------
     # NEW: how often (in epochs) to run the EMA-preview sampling and the
     # full CER validation loop. Both were running every 1-2 epochs, and
@@ -828,6 +856,8 @@ def main():
     parser.add_argument('--sample_every', type=int, default=3)
     parser.add_argument('--validate_every', type=int, default=5)
     args = parser.parse_args()
+
+    print(f"\n{'='*60}\nLAMBDA_L2SP = {args.lambda_l2sp}\n{'='*60}\n")
 
     SEED = 42
     torch.manual_seed(SEED)
@@ -971,6 +1001,17 @@ def main():
     for param_group in optimizer.param_groups:
        param_group['lr'] = args.lr 
 
+    # L2-SP anchor: ALWAYS reads the original legacy checkpoint file directly,
+    # independent of which branch (resume_training / load_check / fresh) loaded
+    # the live `unet` -- so resuming from a later, already-fine-tuned checkpoint
+    # never silently shifts the anchor target.
+    legacy_state_dict = torch.load(f'{args.save_path}/models/ckpt.pt', map_location=args.device, weights_only=True)
+    if any(k.startswith("module.") for k in legacy_state_dict.keys()):
+       legacy_state_dict = {k[len("module."):]: v for k, v in legacy_state_dict.items()}
+    legacy_state_dict = {f"module.{k}" if not k.startswith("module.") else k: v for k, v in legacy_state_dict.items()}
+    original_params = [legacy_state_dict[name].detach().clone() for name, _ in unet.named_parameters()]
+    del legacy_state_dict
+
     warmup_steps = 400
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
        optimizer,
@@ -1006,7 +1047,11 @@ def main():
     feature_extractor = None
 
     if args.train_mode == 'train':
-        train(diffusion, unet, ema, ema_model, vae, optimizer, mse_loss, train_loader, val_loader, style_classes, feature_extractor, vocab_size, ddim, transform, args, tokenizer=tokenizer, text_encoder=text_encoder, lr_scheduler=lr_scheduler, letter2index=letter2index, start_epoch=start_epoch, scaler=scaler)
+        train(diffusion, unet, ema, ema_model, vae, optimizer, mse_loss, train_loader, val_loader, 
+              style_classes, feature_extractor, vocab_size, ddim, transform, args, tokenizer=tokenizer, 
+              text_encoder=text_encoder, lr_scheduler=lr_scheduler, letter2index=letter2index, 
+              start_epoch=start_epoch, scaler=scaler,  original_params=original_params)
+        
     elif args.train_mode == 'sampling':
         print('Sampling started....')
         latest_checkpoint_path = os.path.join(
