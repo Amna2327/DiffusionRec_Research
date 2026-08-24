@@ -27,3 +27,5 @@ output5.out
 word_samples_legacy_finetuned/
 inference/active/sample_four_words_legacy.py
 inference/active/generate_word_samples.py
+output6.out
+output7.out
